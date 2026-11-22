@@ -78,6 +78,10 @@ th:first-child,td:first-child{text-align:left}
 th{color:var(--mut);font-weight:500;font-size:13px}
 .note{font-size:13px;color:var(--mut)}
 .toast{position:fixed;left:50%;transform:translateX(-50%);bottom:96px;background:var(--gr);color:#0D2418;font-weight:600;padding:10px 16px;border-radius:12px}
+.modal{position:fixed;inset:0;z-index:20;background:var(--bg);overflow-y:auto;padding:0 16px 40px}
+.modal .in{max-width:560px;margin:0 auto}
+.close{width:44px;height:44px;border-radius:12px;background:var(--card);border:0;display:grid;place-items:center;cursor:pointer;font-size:22px;color:var(--ink);flex:none}
+.verdict{border-radius:14px;padding:12px;margin-top:10px;font-weight:600}
 @media(prefers-reduced-motion:no-preference){.card{transition:border-color .15s}}
 </style>
 </head>
@@ -192,23 +196,96 @@ function trueUp(a, c, K) {
 }
 
 /* ---------- views ---------- */
-let st = { calc: { charge: null, dist: 300, T: 15, P: 1013, W: 0, H: 3 }, form: null, del: null, addArme: false, addCharge: false, restore: null, ko: null };
+let st = { calc: { charge: null, dist: 300, T: 15, P: 1013, W: 0, H: 3, cible: 20 }, form: null, del: null, addArme: false, addCharge: false, restore: null, ko: null, reopen: null, chk: null };
 function route() {
+  closeModal(true);
   const h = location.hash.slice(1);
-  const m = h.match(/^a-([a-z0-9]+)-(journal|serie|calcul|stats)$/);
-  if (!m || !arme(m[1])) return home();
-  const a = arme(m[1]);
+  let m = h.match(/^a-([a-z0-9]+)(?:-(charges|serie|journal))?$/), mc = h.match(/^a-([a-z0-9]+)-c-([a-z0-9]+)$/);
+  const id = (m || mc || [])[1];
+  if (!id || !arme(id)) return home();
+  const a = arme(id), view = mc ? 'charges' : (m[2] || 'charges');
   tabs.hidden = false;
-  tabs.innerHTML = [['journal', 'j', 'Journal'], ['serie', 'p', 'Série'], ['calcul', 'c', 'Calcul'], ['stats', 's', 'Stats']].map(([k, i, t]) => `<a href="#a-${a.id}-${k}" class="${m[2] === k ? 'on' : ''}">${ICON[i]}${t}</a>`).join('');
-  ({ journal, serie, calcul, stats })[m[2]](a);
+  tabs.style.gridTemplateColumns = 'repeat(3,minmax(0,1fr))';
+  tabs.innerHTML = [['charges', 's', 'Mes charges'], ['serie', 'p', 'Série'], ['journal', 'j', 'Journal']].map(([k, i, t]) => `<a href="#a-${a.id}-${k}" class="${view === k ? 'on' : ''}">${ICON[i]}${t}</a>`).join('');
+  if (mc) { const c = a.charges.find(x => x.id === mc[2]); if (!c) { location.hash = 'a-' + a.id + '-charges'; return; } chargeView(a, c); }
+  else ({ charges, serie, journal })[view](a);
   window.scrollTo(0, 0);
+}
+function serieCard(a, s, withCharge) {
+  const al = alerts(a, s), c = charge(a, s.charge), v = vOf(s);
+  const tag = al.ref ? '<span class="pill p-mut">1re série = référence</span>' : al.msg.length ? `<span class="pill p-red">⚠ ${esc(al.msg.join(' · '))}</span>` : '<span class="pill p-gr">✓ RAS</span>';
+  const sdc = num(s.sd) === '' ? '' : num(s.sd) <= 4 ? 'gr' : num(s.sd) <= 7 ? 'amb' : 'red';
+  return `<article class="card"><div class="row"><div><div style="font-weight:600">${withCharge ? esc(c.nom) : new Date(s.date + 'T12:00').toLocaleDateString('fr-FR')}</div><div class="lab">${esc(s.heure || '')}${s.lieu && !withCharge ? ' · ' + esc(s.lieu) : ''}${s.dist ? ' · ' + esc(s.dist) + ' m' : ''}${s.temp !== '' ? ' · ' + esc(s.temp) + ' °C' : ''}</div></div>${tag}</div>
+    <div class="grid g4" style="margin-top:10px"><div><div class="num" style="font-size:26px">${esc(s.coups)}</div><div class="lab">coups</div></div><div><div class="num cy" style="font-size:26px">${fr(v)}</div><div class="lab">m/s</div></div><div><div class="num ${sdc}" style="font-size:26px">${fr(num(s.sd))}</div><div class="lab">SD</div></div><div><div class="num" style="font-size:26px">${fr(num(s.es))}</div><div class="lab">ES</div></div></div>
+    ${(s.groupe !== '' || s.hausse !== '' || s.notes) ? `<div class="lab" style="margin-top:8px">${s.groupe !== '' ? 'Groupe ' + esc(s.groupe) + ' mm · ' : ''}${s.hausse !== '' ? 'Hausse ' + esc(s.hausse) + ' clics · ' : ''}${esc(s.notes || '')}${s.nettoye ? ' · nettoyé' : ''}</div>` : ''}
+    <div class="row" style="margin-top:10px"><button class="btn b-out" data-ed="${s.id}">Modifier</button>${st.del === s.id ? `<button class="btn b-red" data-okdel="${s.id}">Confirmer la suppression</button>` : `<button class="btn b-out" data-del="${s.id}">Supprimer</button>`}</div></article>`;
+}
+function bindCards(a, redraw) {
+  app.querySelectorAll('[data-del]').forEach(b => b.onclick = () => { st.del = b.dataset.del; redraw(); });
+  app.querySelectorAll('[data-okdel]').forEach(b => b.onclick = () => { a.series = a.series.filter(s => s.id !== b.dataset.okdel); st.del = null; save('Série supprimée'); redraw(); });
+  app.querySelectorAll('[data-ed]').forEach(b => b.onclick = () => { st.form = JSON.parse(JSON.stringify(a.series.find(s => s.id === b.dataset.ed))); location.hash = 'a-' + a.id + '-serie'; });
+}
+function chargeForm() { return `<div class="card" style="margin-top:10px"><div class="grid"><div><label for="cn">Nom court</label><input id="cn" placeholder="ex. Lapua 136 · N150 2,48 g"></div><div class="grid g2"><div><label for="cb">Balle</label><input id="cb"></div><div><label for="cp">Poudre</label><input id="cp"></div></div><div class="grid g4"><div><label for="cg">Poids (gr)</label><input id="cg" inputmode="decimal"></div><div><label for="cl">Long. balle (mm)</label><input id="cl" inputmode="decimal"></div><div><label for="cc">BC G7</label><input id="cc" inputmode="decimal"></div><div><label for="co">OAL</label><input id="co" inputmode="decimal"></div></div><button type="button" class="btn b-amb" id="cok">Ajouter la charge</button></div></div>`; }
+function readCharge(a) { const n = $('#cn').value.trim(); if (!n) return null; const id = uid(); a.charges.push({ id, nom: n, balle: $('#cb').value, poudre: $('#cp').value, grains: num($('#cg').value) || 140, long: num($('#cl').value) || 34, bc: num($('#cc').value) || .3, oal: $('#co').value, masse: '' }); return id; }
+function charges(a) {
+  app.innerHTML = head(a, 'Mes charges') + `<div class="grid g3">
+    <div class="kpi"><div class="num amb">${total(a)}</div><div class="lab">coups au total</div></div>
+    <div class="kpi"><div class="num cy">${sinceClean(a)}</div><div class="lab">depuis nettoyage</div></div>
+    <div class="kpi"><div class="num gr">${a.charges.length}</div><div class="lab">charges</div></div></div><div style="height:14px"></div>
+  ${a.charges.map(c => { const K = know(a, c), ser = sorted(a).filter(s => s.charge === c.id), last = ser[ser.length - 1], al = last ? alerts(a, last) : null;
+    return `<a class="card arme" href="#a-${a.id}-c-${c.id}" style="color:inherit;text-decoration:none"><div class="row"><div><h2>${esc(c.nom)}</h2><div class="lab">${esc([c.balle, c.poudre].filter(Boolean).join(' · '))}</div></div>${al && al.msg.length ? '<span class="pill p-red">⚠</span>' : ''}</div>
+      <div class="grid g4" style="margin-top:10px"><div><div class="num amb" style="font-size:24px">${K.n || ser.reduce((t, s) => t + (+s.coups || 0), 0)}</div><div class="lab">coups</div></div><div><div class="num cy" style="font-size:24px">${K.vref ? fr(K.vref) : '—'}</div><div class="lab">m/s</div></div><div><div class="num ${K.sd ? (K.sd <= 4 ? 'gr' : K.sd <= 7 ? 'amb' : 'red') : ''}" style="font-size:24px">${K.sd ? fr(K.sd) : '—'}</div><div class="lab">SD</div></div><div><div class="num" style="font-size:24px">${ser.length}</div><div class="lab">séries</div></div></div></a>`; }).join('')}
+  ${a.charges.length ? '' : '<div class="card"><h2>Aucune charge</h2><p class="lab">Ajoute ta première charge.</p></div>'}
+  ${st.addCharge ? chargeForm() : '<button class="btn b-amb" id="nc" style="width:100%">+ Ajouter une charge</button>'}`;
+  const nc = $('#nc'); if (nc) nc.onclick = () => { st.addCharge = true; charges(a); };
+  const cok = $('#cok'); if (cok) cok.onclick = () => { const id = readCharge(a); if (!id) return; st.addCharge = false; save('Charge ajoutée'); charges(a); };
+}
+function chargeView(a, c) {
+  const K = know(a, c), ser = sorted(a).filter(s => s.charge === c.id), withShots = ser.filter(s => s.shots && s.shots.length);
+  const es = ser.map(s => num(s.es)).filter(x => x !== '');
+  app.innerHTML = `<div class="top"><a class="back" href="#a-${a.id}-charges" aria-label="Retour à mes charges">${ICON.b}</a><div><h1>${esc(c.nom)}</h1><div class="sub">${esc([c.balle, c.poudre, c.oal ? 'OAL ' + c.oal : ''].filter(Boolean).join(' · '))}</div></div></div>
+  <button class="btn b-amb" id="oc" style="width:100%;font-size:18px;min-height:56px">${ICON.c}&nbsp; Calcul de tir</button>
+  <div class="grid g3" style="margin-top:12px">
+    <div class="kpi"><div class="num amb">${ser.reduce((t, s) => t + (+s.coups || 0), 0)}</div><div class="lab">coups</div></div>
+    <div class="kpi"><div class="num cy">${K.vref ? fr(K.vref) : '—'}</div><div class="lab">V moy (m/s)</div></div>
+    <div class="kpi"><div class="num ${K.sd ? (K.sd <= 4 ? 'gr' : K.sd <= 7 ? 'amb' : 'red') : ''}">${K.sd ? fr(K.sd) : '—'}</div><div class="lab">SD (${K.shots} coups chrono)</div></div>
+    <div class="kpi"><div class="num">${es.length ? fr(mean(es)) : '—'}</div><div class="lab">ES moyen</div></div>
+    <div class="kpi"><div class="num">${K.sens ? fr(K.sens, 2) : '—'}</div><div class="lab">m/s par °C</div></div>
+    <div class="kpi"><div class="num">${fr(c.bc, 3)}</div><div class="lab">BC G7</div></div></div>
+  <div class="card" style="margin-top:12px"><h2>Vitesse coup par coup</h2>${withShots.length ? '<div class="fig"><svg id="sv" role="img" aria-label="Vitesse de chaque coup, par série"></svg></div>' : '<p class="lab">Importe un fichier chrono dans une série pour voir la courbe.</p>'}</div>
+  <div class="day"><h2>Séries</h2><a class="btn b-out" href="#a-${a.id}-serie" id="ns" style="display:flex;align-items:center;color:var(--ink);text-decoration:none">+ Série</a></div>
+  ${ser.length ? ser.slice().reverse().map(s => serieCard(a, s, false)).join('') : '<p class="lab">Pas encore de série avec cette charge.</p>'}`;
+  bindCards(a, () => chargeView(a, c));
+  $('#ns').onclick = () => { st.form = Object.assign(blank(a), { armeId: a.id, charge: c.id }); };
+  $('#oc').onclick = () => openCalc(a, c);
+  const s = $('#sv'); if (s) { const cols = ['#4CC0F2', '#FFB826', '#40E08C', '#E87BD0', '#F25959'];
+    const plot = () => { const W = s.clientWidth, H = s.clientHeight; if (!W) return; const all = withShots.flatMap(x => x.shots), lo = Math.floor(Math.min(...all) / 5) * 5 - 5, hi = Math.ceil(Math.max(...all) / 5) * 5 + 5, n = Math.max(...withShots.map(x => x.shots.length)); const X = i => 40 + i * (W - 50) / Math.max(1, n - 1), Y = v => 10 + (hi - v) / (hi - lo) * (H - 30);
+      s.innerHTML = [lo, (lo + hi) / 2, hi].map(v => `<line x1="40" x2="${W}" y1="${Y(v)}" y2="${Y(v)}" stroke="#323A48"/><text x="0" y="${Y(v) + 4}" fill="#9AA5B5" font-size="12">${Math.round(v)}</text>`).join('') + withShots.map((x, k) => `<polyline fill="none" stroke="${cols[k % 5]}" stroke-width="2.5" stroke-linejoin="round" points="${x.shots.map((v, i) => X(i) + ',' + Y(v)).join(' ')}"/>`).join(''); };
+    const ro = new ResizeObserver(plot); ro.observe(s); }
+  if (st.reopen === c.id) { st.reopen = null; openCalc(a, c); }
+}
+function journal(a) {
+  const ser = sorted(a).reverse(), days = [...new Set(ser.map(s => s.date))];
+  app.innerHTML = head(a, 'Journal') + (days.length ? '' : '<div class="card"><h2>Aucune série</h2><p class="lab">Touche « Série » après ton premier tir.</p></div>')
+    + days.map(d => `<div class="day"><h2 style="text-transform:capitalize">${dayFmt(d)}</h2><span class="lab">${esc(ser.find(s => s.date === d).lieu || '')}</span></div>` + ser.filter(s => s.date === d).map(s => serieCard(a, s, true)).join('')).join('');
+  bindCards(a, () => journal(a));
+}
+/* ---------- calcul en pop-up ---------- */
+let modalEl = null;
+function closeModal(silent) { if (modalEl) { modalEl.remove(); modalEl = null; document.body.style.overflow = ''; } }
+function openCalc(a, c) {
+  closeModal(true);
+  modalEl = document.createElement('div');
+  modalEl.className = 'modal'; modalEl.setAttribute('role', 'dialog'); modalEl.setAttribute('aria-modal', 'true'); modalEl.setAttribute('aria-label', 'Calcul de tir');
+  document.body.appendChild(modalEl); document.body.style.overflow = 'hidden';
+  calcul(a, c);
 }
 function head(a, title) { return `<div class="top"><a class="back" href="#accueil" aria-label="Retour aux armes">${ICON.b}</a><div><h1>${esc(title)}</h1><div class="sub">${esc(a.nom)} · ${esc(a.calibre)}</div></div></div>`; }
 
 function home() {
   tabs.hidden = true;
   app.innerHTML = `<div class="top"><div><h1>Mes armes</h1><div class="sub">Journal de tir · enregistré dans ce téléphone</div></div></div>
-  ${D.armes.map(a => { const last = sorted(a).pop(); return `<a class="card arme" href="#a-${a.id}-journal" style="color:inherit;text-decoration:none">
+  ${D.armes.map(a => { const last = sorted(a).pop(); return `<a class="card arme" href="#a-${a.id}-charges" style="color:inherit;text-decoration:none">
     <div class="row"><div><h2>${esc(a.nom)}</h2><div class="lab">${[a.calibre, a.canon, 'pas 1:' + a.pas].filter(Boolean).map(esc).join(' · ')}</div></div><span class="num amb" style="font-size:34px">${total(a)}</span></div>
     <div class="row" style="margin-top:8px"><span class="lab">${last ? 'Dernière séance : ' + dayFmt(last.date) : 'Pas encore de séance'}</span><span class="lab">coups</span></div></a>`; }).join('')}
   ${st.addArme ? `<form class="card" id="fa"><h2 style="margin-bottom:12px">Nouvelle arme</h2>
@@ -228,29 +305,7 @@ function home() {
   if (st.restore) { $('#rsn').onclick = () => { st.restore = null; home(); }; $('#rsy').onclick = () => { D = st.restore; st.restore = null; save('Journal restauré'); home(); }; }
   const ib = $('#inst'); if (ib) ib.onclick = () => { installEvt.prompt(); installEvt.userChoice.finally(() => { installEvt = null; home(); }); };
   const aa = $('#aa'); if (aa) aa.onclick = () => { st.addArme = true; home(); };
-  const f = $('#fa'); if (f) { $('#acx').onclick = () => { st.addArme = false; home(); }; f.onsubmit = e => { e.preventDefault(); const id = uid(); D.armes.push({ id, nom: $('#an').value.trim(), calibre: $('#ac').value.trim(), canon: $('#ak').value.trim(), pas: num($('#ap').value) || 8, haut: num($('#ah').value) || 50, zero: num($('#az').value) || 100, coupsAvant: 0, charges: [], series: [] }); st.addArme = false; save('Arme ajoutée'); location.hash = 'a-' + id + '-journal'; }; }
-}
-
-function journal(a) {
-  const ser = sorted(a).reverse(), days = [...new Set(ser.map(s => s.date))];
-  app.innerHTML = head(a, 'Journal') + `<div class="grid g3">
-    <div class="kpi"><div class="num amb">${total(a)}</div><div class="lab">coups au total</div></div>
-    <div class="kpi"><div class="num cy">${sinceClean(a)}</div><div class="lab">depuis nettoyage</div></div>
-    <div class="kpi"><div class="num gr">${a.series.length}</div><div class="lab">séries</div></div></div>
-  ${days.length ? '' : '<div class="card" style="margin-top:16px"><h2>Aucune série</h2><p class="lab">Touche « Nouvelle série » après ton premier tir.</p></div>'}
-  ${days.map(d => `<div class="day"><h2 style="text-transform:capitalize">${dayFmt(d)}</h2><span class="lab">${esc(ser.find(s => s.date === d).lieu || '')}</span></div>` + ser.filter(s => s.date === d).map(s => {
-    const al = alerts(a, s), c = charge(a, s.charge), v = vOf(s);
-    const tag = al.ref ? '<span class="pill p-mut">1re série = référence</span>' : al.msg.length ? `<span class="pill p-red">⚠ ${esc(al.msg.join(' · '))}</span>` : '<span class="pill p-gr">✓ RAS</span>';
-    const sdc = num(s.sd) === '' ? '' : num(s.sd) <= 4 ? 'gr' : num(s.sd) <= 7 ? 'amb' : 'red';
-    return `<article class="card"><div class="row"><div><div style="font-weight:600">${esc(c.nom)}</div><div class="lab">${esc(s.heure || '')}${s.dist ? ' · ' + esc(s.dist) + ' m' : ''}${s.temp !== '' ? ' · ' + esc(s.temp) + ' °C' : ''}</div></div>${tag}</div>
-      <div class="grid g4" style="margin-top:10px"><div><div class="num" style="font-size:26px">${esc(s.coups)}</div><div class="lab">coups</div></div><div><div class="num cy" style="font-size:26px">${fr(v)}</div><div class="lab">m/s</div></div><div><div class="num ${sdc}" style="font-size:26px">${fr(num(s.sd))}</div><div class="lab">SD</div></div><div><div class="num" style="font-size:26px">${fr(num(s.es))}</div><div class="lab">ES</div></div></div>
-      ${(s.groupe !== '' || s.hausse !== '' || s.notes) ? `<div class="lab" style="margin-top:8px">${s.groupe !== '' ? 'Groupe ' + esc(s.groupe) + ' mm · ' : ''}${s.hausse !== '' ? 'Hausse ' + esc(s.hausse) + ' clics · ' : ''}${esc(s.notes || '')}${s.nettoye ? ' · nettoyé' : ''}</div>` : ''}
-      <div class="row" style="margin-top:10px"><button class="btn b-out" data-ed="${s.id}">Modifier</button>${st.del === s.id ? `<button class="btn b-red" data-ok="${s.id}">Confirmer la suppression</button>` : `<button class="btn b-out" data-del="${s.id}">Supprimer</button>`}</div></article>`;
-  }).join('')).join('')}
-  <a class="btn b-amb fab" href="#a-${a.id}-serie">${ICON.p}Nouvelle série</a>`;
-  app.querySelectorAll('[data-del]').forEach(b => b.onclick = () => { st.del = b.dataset.del; journal(a); });
-  app.querySelectorAll('[data-ok]').forEach(b => b.onclick = () => { a.series = a.series.filter(s => s.id !== b.dataset.ok); st.del = null; save('Série supprimée'); journal(a); });
-  app.querySelectorAll('[data-ed]').forEach(b => b.onclick = () => { st.form = JSON.parse(JSON.stringify(a.series.find(s => s.id === b.dataset.ed))); location.hash = 'a-' + a.id + '-serie'; });
+  const f = $('#fa'); if (f) { $('#acx').onclick = () => { st.addArme = false; home(); }; f.onsubmit = e => { e.preventDefault(); const id = uid(); D.armes.push({ id, nom: $('#an').value.trim(), calibre: $('#ac').value.trim(), canon: $('#ak').value.trim(), pas: num($('#ap').value) || 8, haut: num($('#ah').value) || 50, zero: num($('#az').value) || 100, coupsAvant: 0, charges: [], series: [] }); st.addArme = false; save('Arme ajoutée'); location.hash = 'a-' + id + '-charges'; }; }
 }
 
 function blank(a) { const n = new Date(), last = sorted(a).pop(); return { id: null, date: n.toISOString().slice(0, 10), heure: n.toTimeString().slice(0, 5), lieu: last ? last.lieu : '', charge: last ? last.charge : (a.charges[0] || {}).id, coups: 5, dist: last ? last.dist : 100, temp: '', v: '', sd: '', es: '', groupe: '', hausse: '', derive: '', nettoye: false, notes: '', shots: [] }; }
@@ -259,7 +314,7 @@ function serie(a) {
   const sv = f.shots.length ? `Fichier importé : ${f.shots.length} vitesses · moy ${fr(mean(f.shots))} · SD ${fr(sdev(f.shots))} · ES ${fr(Math.max(...f.shots) - Math.min(...f.shots))}` : '';
   app.innerHTML = head(a, f.id ? 'Modifier la série' : 'Nouvelle série') + `<form id="fs">
   <div class="sec">Charge</div><div class="chips">${a.charges.map(c => `<button type="button" class="chip ${f.charge === c.id ? 'on' : ''}" data-c="${c.id}"><div style="font-weight:600">${esc(c.nom)}</div><div class="lab">${esc(c.poudre)}${c.oal ? ' · OAL ' + esc(c.oal) : ''}</div></button>`).join('')}<button type="button" class="chip" id="nc">+ Charge</button></div>
-  ${st.addCharge ? `<div class="card" style="margin-top:10px"><div class="grid"><div><label for="cn">Nom court</label><input id="cn" placeholder="ex. Hornady 140 · H4350 2,70 g"></div><div class="grid g2"><div><label for="cb">Balle</label><input id="cb"></div><div><label for="cp">Poudre</label><input id="cp"></div></div><div class="grid g4"><div><label for="cg">Poids (gr)</label><input id="cg" inputmode="decimal"></div><div><label for="cl">Long. (mm)</label><input id="cl" inputmode="decimal"></div><div><label for="cc">BC G7</label><input id="cc" inputmode="decimal"></div><div><label for="co">OAL</label><input id="co" inputmode="decimal"></div></div><button type="button" class="btn b-amb" id="cok">Ajouter la charge</button></div></div>` : ''}
+  ${st.addCharge ? chargeForm() : ''}
   <div class="grid g2" style="margin-top:14px"><div><label for="fd">Date</label><input id="fd" type="date" value="${esc(f.date)}"></div><div><label for="fl">Lieu</label><input id="fl" value="${esc(f.lieu)}"></div></div>
   <div class="grid g2" style="margin-top:10px"><div class="kpi"><div class="lab">Coups</div><div class="step"><button type="button" id="cm" aria-label="Un coup de moins">−</button><span class="num amb">${esc(f.coups)}</span><button type="button" id="cpl" aria-label="Un coup de plus">+</button></div></div>
     <div class="grid"><div><label for="fdi">Distance de ces ${esc(f.coups)} coups (m)</label><input id="fdi" inputmode="numeric" value="${esc(f.dist)}"></div><div><label for="ft">Température (°C)</label><input id="ft" inputmode="decimal" value="${esc(f.temp)}"></div></div></div>
@@ -274,82 +329,73 @@ function serie(a) {
   const keep = () => { const g = id => { const e = $('#' + id); return e ? e.value : undefined; }; Object.assign(f, { date: g('fd'), lieu: g('fl'), dist: g('fdi'), temp: g('ft'), groupe: g('fg'), hausse: g('fh'), derive: g('fde'), notes: g('fn'), nettoye: $('#fc').checked }); if ($('#fv')) Object.assign(f, { v: g('fv'), sd: g('fsd'), es: g('fes') }); };
   app.querySelectorAll('[data-c]').forEach(b => b.onclick = () => { keep(); f.charge = b.dataset.c; serie(a); });
   $('#nc').onclick = () => { keep(); st.addCharge = !st.addCharge; serie(a); };
-  const cok = $('#cok'); if (cok) cok.onclick = () => { const n = $('#cn').value.trim(); if (!n) return; const id = uid(); a.charges.push({ id, nom: n, balle: $('#cb').value, poudre: $('#cp').value, grains: num($('#cg').value) || 140, long: num($('#cl').value) || 34, bc: num($('#cc').value) || .3, oal: $('#co').value, masse: '' }); keep(); f.charge = id; st.addCharge = false; save('Charge ajoutée'); serie(a); };
+  const cok = $('#cok'); if (cok) cok.onclick = () => { keep(); const id = readCharge(a); if (!id) return; f.charge = id; st.addCharge = false; save('Charge ajoutée'); serie(a); };
   $('#cm').onclick = () => { keep(); f.coups = Math.max(1, f.coups - 1); serie(a); };
   $('#cpl').onclick = () => { keep(); f.coups++; serie(a); };
   $('#csv').onchange = e => { const file = e.target.files[0]; if (!file) return; file.text().then(t => { keep(); const shots = []; for (const line of t.split(/\r?\n/)) { const m = line.match(/^\s*\d+\s*[,;]\s*"?(\d{3,4}(?:[.,]\d+)?)"?/); if (m) shots.push(parseFloat(m[1].replace(',', '.'))); } if (!shots.length) { toast('Aucune vitesse trouvée'); return; } f.shots = shots; f.coups = shots.length; f.v = fr(mean(shots)); f.sd = +sdev(shots).toFixed(1); f.es = +(Math.max(...shots) - Math.min(...shots)).toFixed(1); serie(a); }); };
   $('#fs').onsubmit = e => { e.preventDefault(); keep(); if (!f.charge) { toast('Ajoute une charge'); return; } const s = { id: f.id || uid(), date: f.date, heure: f.heure, lieu: f.lieu, charge: f.charge, coups: f.coups, dist: num(f.dist), temp: num(f.temp), v: f.shots.length ? '' : num(f.v), sd: num(f.sd), es: num(f.es), groupe: num(f.groupe), hausse: num(f.hausse), derive: num(f.derive), nettoye: f.nettoye, notes: f.notes, shots: f.shots };
-    const i = a.series.findIndex(x => x.id === s.id); if (i >= 0) a.series[i] = s; else a.series.push(s); st.form = null; save('Série enregistrée'); location.hash = 'a-' + a.id + '-journal'; };
+    const i = a.series.findIndex(x => x.id === s.id); if (i >= 0) a.series[i] = s; else a.series.push(s); st.form = null; save('Série enregistrée'); location.hash = 'a-' + a.id + '-c-' + s.charge; };
 }
 
-function calcul(a) {
-  const C = st.calc; if (!a.charges.find(c => c.id === C.charge)) C.charge = (a.charges[0] || {}).id;
-  const c = a.charges.find(x => x.id === C.charge);
-  if (!c) { app.innerHTML = head(a, 'Calculateur') + '<div class="card"><p>Ajoute d\'abord une charge dans « Série ».</p></div>'; return; }
+function calcul(a, c) {
+  if (!modalEl) return;
+  const C = st.calc;
   a.verifs = a.verifs || [];
   const K = know(a, c);
-  const chips = `<div class="chips">${a.charges.map(x => `<button type="button" class="chip ${x.id === c.id ? 'on' : ''}" data-c="${x.id}">${esc(x.nom)}</button>`).join('')}</div>`;
-  if (!K.vref) { app.innerHTML = head(a, 'Calculateur') + chips + '<div class="card" style="margin-top:12px"><h2>Pas encore de vitesse mesurée</h2><p class="lab">Enregistre une série avec ton chrono pour activer le calculateur.</p></div>'; app.querySelectorAll('[data-c]').forEach(b => b.onclick = () => { C.charge = b.dataset.c; calcul(a); }); return; }
+  const top = `<div class="top"><button class="close" id="xc" aria-label="Fermer le calcul">✕</button><div><h1>Calcul de tir</h1><div class="sub">${esc(c.nom)}</div></div></div>`;
+  if (!K.vref) { modalEl.innerHTML = `<div class="in">${top}<div class="card"><h2>Pas encore de vitesse mesurée</h2><p class="lab">Enregistre une série avec ton chrono pour activer le calcul.</p></div></div>`; $('#xc').onclick = () => closeModal(); return; }
   const TR = trueUp(a, c, K);
-  const pend = a.verifs.filter(v => v.charge === c.id && !v.result);
-  const done = a.verifs.filter(v => v.charge === c.id && v.result).slice(-6).reverse();
-  app.innerHTML = head(a, 'Calculateur') + chips + `
-  <div class="card" style="margin:12px 0"><div class="grid g3">
+  const done = a.verifs.filter(v => v.charge === c.id && v.result).slice(-8).reverse();
+  const Q = st.chk && st.chk.charge === c.id ? st.chk : null;
+  modalEl.innerHTML = `<div class="in">${top}
+  <div class="card" style="margin-bottom:12px"><div class="grid g3">
     <div><div class="num cy" style="font-size:24px" id="kv"></div><div class="lab">V0 du jour</div></div>
     <div><div class="num ${K.sd <= 4 ? 'gr' : K.sd <= 7 ? 'amb' : 'red'}" style="font-size:24px">${K.sd ? fr(K.sd) : '—'}</div><div class="lab">SD chrono (${K.shots || K.n} coups)</div></div>
     <div><div class="num ${TR.n ? 'gr' : ''}" style="font-size:24px">${TR.n ? (TR.dv > 0 ? '+' : '') + TR.dv + ' m/s' : '—'}</div><div class="lab">${TR.n ? 'recalage sur ' + TR.n + ' vérif.' : 'pas encore recalé'}</div></div></div>
     <p class="note" style="margin:8px 0 0">Vref ${fr(K.vref)} m/s à ${fr(K.tref, 0)} °C${K.sens ? ' · ' + (K.sens > 0 ? '+' : '') + fr(K.sens, 2) + ' m/s par °C (mesuré)' : ' · sensibilité T° pas encore mesurable'}${TR.n && TR.bm !== 1 ? ' · BC ×' + fr(TR.bm, 3) + ' (tirs ≥ 600 m)' : ''}${TR.n && TR.dm !== 1 ? ' · dérive ×' + fr(TR.dm, 2) : ''}</p>${Math.abs(TR.dv) > 25 ? '<p class="note amb" style="margin:6px 0 0">⚠ Gros recalage (' + (TR.dv > 0 ? '+' : '') + TR.dv + ' m/s) : vérifie aussi ton zéro et la valeur réelle d\'un clic de ta lunette.</p>' : ''}</div>
-  <div class="big" id="res"></div>
+  <div class="grid g4"><div><label for="rt">T° (°C)</label><input id="rt" inputmode="decimal" value="${C.T}"></div><div><label for="rp">hPa</label><input id="rp" inputmode="numeric" value="${C.P}"></div><div><label for="rw">Vent m/s</label><input id="rw" inputmode="decimal" value="${C.W}"></div><div><label for="rh">Heure</label><select id="rh">${[...Array(12)].map((_, i) => `<option ${C.H === i + 1 ? 'selected' : ''}>${i + 1}</option>`).join('')}</select></div></div>
+
+  <div class="card" style="margin-top:14px;border-color:var(--amb)"><h2 style="margin-bottom:10px">🎯 Vérifier une distance</h2>
+    <div class="grid g3"><div><label for="qd">Distance (m)</label><input id="qd" inputmode="numeric" value="${Q ? Q.dist : C.dist}"></div><div><label for="qc">Taille cible (cm)</label><input id="qc" inputmode="decimal" value="${Q ? Q.cible : (C.cible || 20)}"></div><div style="display:flex;align-items:flex-end"><button class="btn b-amb" id="qgo" style="width:100%">Calculer</button></div></div>
+    <div id="qres"></div></div>
+
+  <div class="big" id="res" style="margin-top:14px"></div>
   <p class="note" id="unc" style="text-align:center;margin:6px 0 0"></p>
   <div style="margin-top:10px"><div class="row"><label for="rd" class="amb" style="font-weight:600">Distance</label><span class="num amb" style="font-size:30px" id="dv"></span></div><input id="rd" type="range" min="100" max="1200" step="10" value="${C.dist}"></div>
-  <div class="grid g4"><div><label for="rt">T° (°C)</label><input id="rt" inputmode="decimal" value="${C.T}"></div><div><label for="rp">hPa</label><input id="rp" inputmode="numeric" value="${C.P}"></div><div><label for="rw">Vent m/s</label><input id="rw" inputmode="decimal" value="${C.W}"></div><div><label for="rh">Heure</label><select id="rh">${[...Array(12)].map((_, i) => `<option ${C.H === i + 1 ? 'selected' : ''}>${i + 1}</option>`).join('')}</select></div></div>
-  <button class="btn b-amb" id="vf" style="width:100%;margin-top:12px">🎯 Vérifier cette correction au tir</button>
-  ${pend.map(v => `<div class="card" style="margin-top:12px;border-color:var(--amb)"><div class="row"><div><b>À vérifier · ${v.dist} m</b><div class="lab">Proposé : hausse ${v.propH} · dérive ${v.propD} · ${fr(v.T, 0)} °C${v.W ? ' · vent ' + fr(v.W) + ' m/s à ' + v.H + ' h' : ''}</div></div><button class="btn b-out" data-x="${v.id}" aria-label="Supprimer cette vérification" style="min-height:44px;padding:0 12px">✕</button></div>
-    ${st.ko === v.id ? `<div class="grid g2" style="margin-top:10px"><div><label for="kh">Hausse qui touche (clics)</label><input id="kh" inputmode="numeric" value="${v.propH}"></div><div><label for="kd">Dérive qui touche (clics, + = droite)</label><input id="kd" inputmode="numeric" value="${v.propD}"></div></div><button class="btn b-amb" data-ks="${v.id}" style="width:100%;margin-top:10px">Enregistrer la vraie correction</button>`
-    : `<div class="grid g2" style="margin-top:10px"><button class="btn b-out" data-ok="${v.id}" style="border-color:var(--gr);color:var(--gr)">✓ Bonne, ça touche</button><button class="btn b-red" data-ko="${v.id}">✗ Pas bonne</button></div>`}</div>`).join('')}
-  ${done.length ? `<h2 style="margin:20px 0 8px">Vérifications</h2><div class="scroll"><table><thead><tr><th>Date</th><th>Dist.</th><th>Proposé</th><th>Réel</th><th>Écart</th></tr></thead><tbody>${done.map(v => `<tr><td>${new Date(v.date).toLocaleDateString('fr-FR')}</td><td>${v.dist} m</td><td>${v.propH} / ${v.propD}</td><td>${v.realH} / ${v.realD}</td><td class="${v.realH === v.propH && v.realD === v.propD ? 'gr' : 'amb'}">${v.realH - v.propH > 0 ? '+' : ''}${v.realH - v.propH}</td></tr>`).join('')}</tbody></table></div>` : ''}
   <div class="grid g3" style="margin-top:12px" id="sub"></div>
+  ${done.length ? `<h2 style="margin:20px 0 8px">Vérifications</h2><div class="scroll"><table><thead><tr><th>Date</th><th>Dist.</th><th>Cible</th><th>Proposé</th><th>Réel</th><th></th></tr></thead><tbody>${done.map(v => `<tr><td>${new Date(v.date).toLocaleDateString('fr-FR')}</td><td>${v.dist} m</td><td>${v.cible ? v.cible + ' cm' : '—'}</td><td>${v.propH} / ${v.propD}</td><td>${v.realH} / ${v.realD}</td><td><button class="btn b-out" data-x="${v.id}" aria-label="Supprimer cette vérification" style="min-height:36px;padding:0 10px">✕</button></td></tr>`).join('')}</tbody></table></div>` : ''}
   <h2 style="margin:20px 0 8px">Table de tir</h2><div class="scroll"><table><thead><tr><th>Distance</th><th>Hausse</th><th>±</th><th>Dérive</th><th>m/s</th></tr></thead><tbody id="tb"></tbody></table></div>
-  <p class="note">Clics de 0,1 MRAD, dérive + = droite. « ± » = dispersion verticale due au SD de ta munition : un écart plus petit que ça n'est pas une erreur du calcul. Chaque vérification « pas bonne » recale le modèle : sous 600 m la vitesse, au-delà le BC, et la dérive par vent ; les « bonnes » le confirment.</p>`;
-  app.querySelectorAll('[data-c]').forEach(b => b.onclick = () => { C.charge = b.dataset.c; calcul(a); });
-  let cur = null;
+  <p class="note">Clics de 0,1 MRAD, dérive + = droite. « ± » = dispersion verticale due au SD de ta munition. Chaque correction « corrigée » recale le modèle : sous 600 m la vitesse, au-delà le BC, et la dérive par vent ; les « validées » le confirment.</p></div>`;
+  const cond = () => { C.T = num($('#rt').value); if (C.T === '') C.T = 15; C.P = num($('#rp').value) || 1013; C.W = num($('#rw').value) || 0; C.H = +$('#rh').value; };
+  const model = (dv0 = 0) => solve(a, c, v0At(K, C.T) + TR.dv + dv0, C.T, C.P, C.W, C.H, TR.bm, TR.dm);
+  const pmAt = d => K.sd ? Math.abs(model(-K.sd)(d).hf - model(K.sd)(d).hf) / 2 : 0;
   const draw = () => {
-    C.dist = +$('#rd').value; C.T = num($('#rt').value); if (C.T === '') C.T = 15; C.P = num($('#rp').value) || 1013; C.W = num($('#rw').value) || 0; C.H = +$('#rh').value;
-    const v0 = v0At(K, C.T) + TR.dv, f = solve(a, c, v0, C.T, C.P, C.W, C.H, TR.bm, TR.dm), r = f(C.dist);
-    const lo = solve(a, c, v0 - K.sd, C.T, C.P, C.W, C.H, TR.bm, TR.dm), hi = solve(a, c, v0 + K.sd, C.T, C.P, C.W, C.H, TR.bm, TR.dm);
-    const pm = d => Math.abs(lo(d).hf - hi(d).hf) / 2;
-    cur = { dist: C.dist, T: C.T, P: C.P, W: C.W, H: C.H, propH: r.h, propD: r.d };
-    $('#kv').textContent = fr(v0);
+    cond(); C.dist = +$('#rd').value;
+    const f = model(), r = f(C.dist), u = pmAt(C.dist);
+    $('#kv').textContent = fr(v0At(K, C.T) + TR.dv);
     $('#dv').textContent = C.dist + ' m';
     $('#res').innerHTML = `<div><span>HAUSSE</span><span class="num">${r.h}</span><span>clics ${r.h >= 0 ? '↑ haut' : '↓ bas'}</span></div><div style="border-left:1px solid #245A3D"><span>DÉRIVE</span><span class="num">${Math.abs(r.d)}</span><span>clics ${r.d > 0 ? '→ droite' : r.d < 0 ? '← gauche' : ''}</span></div>`;
-    const u = pm(C.dist), cm = u * C.dist / 100;
-    $('#unc').textContent = K.sd ? `± ${fr(u)} clic (≈ ±${fr(cm)} cm en hauteur) dû au SD de ${fr(K.sd)} m/s` : 'Pas de SD connu : importe un fichier chrono pour estimer la dispersion.';
+    $('#unc').textContent = K.sd ? `± ${fr(u)} clic (≈ ±${fr(u * C.dist / 100)} cm en hauteur) dû au SD de ${fr(K.sd)} m/s` : '';
     $('#sub').innerHTML = `<div class="kpi"><div class="num cy" style="font-size:24px">${Math.round(r.v)}</div><div class="lab">m/s cible</div></div><div class="kpi"><div class="num cy" style="font-size:24px">${Math.round(r.e)}</div><div class="lab">joules</div></div><div class="kpi"><div class="num ${r.m < 1.2 ? 'red' : 'cy'}" style="font-size:24px">${fr(r.m, 2)}</div><div class="lab">Mach</div></div>`;
-    $('#tb').innerHTML = [100, 200, 300, 400, 500, 600, 700, 800, 900, 1000].map(d => { const q = f(d); return `<tr><td>${d} m</td><td class="gr"><b>${q.h}</b></td><td class="lab">${K.sd ? '±' + fr(pm(d)) : '—'}</td><td>${q.d}</td><td>${Math.round(q.v)}</td></tr>`; }).join('');
+    $('#tb').innerHTML = [100, 200, 300, 400, 500, 600, 700, 800, 900, 1000].map(d => { const q = f(d); return `<tr><td>${d} m</td><td class="gr"><b>${q.h}</b></td><td class="lab">${K.sd ? '±' + fr(pmAt(d)) : '—'}</td><td>${q.d}</td><td>${Math.round(q.v)}</td></tr>`; }).join('');
+    if (Q) {
+      const q = f(Q.dist), uq = pmAt(Q.dist), half = (Q.cible / 2) / (Q.dist / 100), marge = half - uq - .5;
+      Q.propH = q.h; Q.propD = q.d; Object.assign(Q, { T: C.T, P: C.P, W: C.W, H: C.H });
+      $('#qres').innerHTML = `<div class="grid g2" style="margin-top:12px"><div class="kpi" style="text-align:center"><div class="lab">Hausse</div><div class="num gr" style="font-size:44px">${q.h}</div><div class="lab">clics ${q.h >= 0 ? '↑' : '↓'}</div></div><div class="kpi" style="text-align:center"><div class="lab">Dérive</div><div class="num gr" style="font-size:44px">${Math.abs(q.d)}</div><div class="lab">clics ${q.d > 0 ? '→' : q.d < 0 ? '←' : ''}</div></div></div>
+        <div class="verdict" style="background:${marge >= 0 ? '#163A2A' : '#3A2E10'};color:${marge >= 0 ? 'var(--gr)' : 'var(--amb)'}">${marge >= 0 ? '✓ Marge confortable' : '⚠ Cible juste pour ta munition'} : la cible fait ±${fr(half)} clic, ta dispersion verticale ±${fr(uq)} clic + l'arrondi du clic ±0,5.</div>
+        ${st.ko ? `<div class="grid g2" style="margin-top:10px"><div><label for="kh">Hausse qui touche (clics)</label><input id="kh" inputmode="numeric" value="${q.h}"></div><div><label for="kd">Dérive qui touche (+ = droite)</label><input id="kd" inputmode="numeric" value="${q.d}"></div></div><button class="btn b-amb" id="qsave" style="width:100%;margin-top:10px">Enregistrer la correction</button>`
+        : `<div class="grid g2" style="margin-top:10px"><button class="btn b-out" id="qok" style="border-color:var(--gr);color:var(--gr)">✓ Validé, touché</button><button class="btn b-red" id="qko">✗ Corriger</button></div>`}`;
+      const rec = (res, h, d) => { a.verifs.push({ id: uid(), charge: c.id, date: Date.now(), dist: Q.dist, cible: Q.cible, T: Q.T, P: Q.P, W: Q.W, H: Q.H, propH: Q.propH, propD: Q.propD, result: res, realH: h, realD: d }); st.chk = null; st.ko = null; save(res === 'ok' ? 'Validé : le calcul colle' : 'Modèle recalé'); calcul(a, c); };
+      const ok = $('#qok'); if (ok) ok.onclick = () => rec('ok', Q.propH, Q.propD);
+      const ko = $('#qko'); if (ko) ko.onclick = () => { st.ko = true; draw(); };
+      const sv = $('#qsave'); if (sv) sv.onclick = () => { const h = num($('#kh').value), d = num($('#kd').value); rec('ko', h === '' ? Q.propH : Math.round(h), d === '' ? Q.propD : Math.round(d)); };
+    }
   };
   ['#rd', '#rt', '#rp', '#rw', '#rh'].forEach(s => $(s).oninput = draw);
+  $('#qgo').onclick = () => { const d = Math.round(num($('#qd').value)), t = num($('#qc').value); if (!(d >= 10 && d <= 1200) || !(t > 0)) { toast('Distance (10 à 1200 m) et taille de cible'); return; } C.cible = t; st.ko = null; st.chk = { charge: c.id, dist: d, cible: t }; calcul(a, c); };
+  $('#xc').onclick = () => { st.chk = null; st.ko = null; closeModal(); };
+  modalEl.querySelectorAll('[data-x]').forEach(b => b.onclick = () => { a.verifs = a.verifs.filter(v => v.id !== b.dataset.x); save(); calcul(a, c); });
   draw();
-  $('#vf').onclick = () => { a.verifs.push(Object.assign({ id: uid(), charge: c.id, date: Date.now(), result: null }, cur)); save('Correction à vérifier ajoutée'); calcul(a); };
-  const V = id => a.verifs.find(v => v.id === id);
-  app.querySelectorAll('[data-ok]').forEach(b => b.onclick = () => { const v = V(b.dataset.ok); Object.assign(v, { result: 'ok', realH: v.propH, realD: v.propD }); save('Confirmé : le calcul colle'); calcul(a); });
-  app.querySelectorAll('[data-ko]').forEach(b => b.onclick = () => { st.ko = b.dataset.ko; calcul(a); });
-  app.querySelectorAll('[data-ks]').forEach(b => b.onclick = () => { const v = V(b.dataset.ks), h = num($('#kh').value), d = num($('#kd').value); Object.assign(v, { result: 'ko', realH: h === '' ? v.propH : Math.round(h), realD: d === '' ? v.propD : Math.round(d) }); st.ko = null; save('Modèle recalé'); calcul(a); });
-  app.querySelectorAll('[data-x]').forEach(b => b.onclick = () => { a.verifs = a.verifs.filter(v => v.id !== b.dataset.x); save(); calcul(a); });
-}
-
-function stats(a) {
-  const ser = sorted(a).filter(s => s.shots && s.shots.length);
-  const cols = ['#4CC0F2', '#FFB826', '#40E08C', '#E87BD0', '#F25959'];
-  const byC = a.charges.map((c, i) => { const s = a.series.filter(x => x.charge === c.id && num(x.sd) !== ''); return { c, col: cols[i % 5], n: a.series.filter(x => x.charge === c.id).reduce((t, x) => t + (+x.coups || 0), 0), sd: s.length ? mean(s.map(x => num(x.sd))) : '', es: s.length ? mean(s.map(x => num(x.es))) : '' }; });
-  const best = byC.filter(x => x.sd !== '').sort((x, y) => x.sd - y.sd)[0];
-  app.innerHTML = head(a, 'Stats') + `<div class="grid g2"><div class="kpi"><div class="num amb">${total(a)}</div><div class="lab">coups tirés</div></div><div class="kpi"><div class="num gr">${best ? fr(best.sd) : '—'}</div><div class="lab">meilleur SD moyen${best ? ' · ' + esc(best.c.nom) : ''}</div></div></div>
-  <div class="card" style="margin-top:12px"><h2>Vitesse coup par coup</h2><div class="fig"><svg id="sv" role="img" aria-label="Vitesse de chaque coup, par série"></svg></div>
-  <div class="chips">${ser.map(s => { const i = a.charges.findIndex(c => c.id === s.charge); return `<span class="lab"><b style="color:${cols[i % 5]}">●</b> ${esc(charge(a, s.charge).nom)} · ${new Date(s.date + 'T12:00').toLocaleDateString('fr-FR')}</span>`; }).join('')}</div></div>
-  <div class="card"><h2 style="margin-bottom:10px">Régularité par charge</h2>${byC.map(x => `<div style="margin-bottom:12px"><div class="row"><span>${esc(x.c.nom)}</span><span class="lab">${x.n} coups · SD ${fr(x.sd)} · ES ${fr(x.es)}</span></div><div class="bar"><i style="width:${x.sd === '' ? 0 : Math.min(100, x.sd * 10)}%;background:${x.sd === '' ? 'none' : x.sd <= 4 ? '#40E08C' : x.sd <= 7 ? '#FFB826' : '#F25959'}"></i></div></div>`).join('')}<p class="note">Barre courte = charge régulière (échelle SD 0 à 10 m/s).</p></div>`;
-  const s = $('#sv');
-  const plot = () => { const W = s.clientWidth, H = s.clientHeight; if (!W || !ser.length) { s.innerHTML = ''; return; } const all = ser.flatMap(x => x.shots), lo = Math.floor(Math.min(...all) / 5) * 5 - 5, hi = Math.ceil(Math.max(...all) / 5) * 5 + 5, n = Math.max(...ser.map(x => x.shots.length)); const X = i => 40 + i * (W - 50) / Math.max(1, n - 1), Y = v => 10 + (hi - v) / (hi - lo) * (H - 30);
-    s.innerHTML = [lo, (lo + hi) / 2, hi].map(v => `<line x1="40" x2="${W}" y1="${Y(v)}" y2="${Y(v)}" stroke="#323A48"/><text x="0" y="${Y(v) + 4}" fill="#9AA5B5" font-size="12">${Math.round(v)}</text>`).join('') + ser.map(x => { const col = cols[a.charges.findIndex(c => c.id === x.charge) % 5]; return `<polyline fill="none" stroke="${col}" stroke-width="2.5" stroke-linejoin="round" points="${x.shots.map((v, i) => X(i) + ',' + Y(v)).join(' ')}"/>`; }).join(''); };
-  const ro = new ResizeObserver(plot); ro.observe(s);
 }
 
 try { navigator.storage && navigator.storage.persist && navigator.storage.persist(); } catch (e) {}
