@@ -91,6 +91,7 @@ const raw = document.getElementById('data').textContent.replace('/*DATA*/','').r
 let D = JSON.parse(raw);
 try { const l = localStorage.getItem('journal-tir'); if (l) { const o = JSON.parse(l); if ((o.t||0) > (D.t||0)) D = o; } } catch (e) {}
 
+let installEvt = null;
 const $ = s => document.querySelector(s);
 const app = $('#app'), tabs = $('#tabs');
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -181,6 +182,7 @@ function home() {
     <div class="grid g3"><div><label for="ap">Pas (pouces)</label><input id="ap" inputmode="decimal" value="8"></div><div><label for="ah">Haut. axe (mm)</label><input id="ah" inputmode="decimal" value="50"></div><div><label for="az">Zéro (m)</label><input id="az" inputmode="decimal" value="100"></div></div>
     <div class="row"><button type="button" class="btn b-out" id="acx">Annuler</button><button class="btn b-amb">Créer l'arme</button></div></div></form>`
   : `<button class="btn b-amb" id="aa" style="width:100%">+ Ajouter une arme</button>`}
+  ${installEvt ? `<button class="btn b-out" id="inst" style="width:100%;margin-top:10px;border-color:var(--gr);color:var(--gr)">⬇ Installer l'application sur ce téléphone</button>` : ''}
   <div class="card" style="margin-top:18px"><h2 style="margin-bottom:6px">Sauvegarde</h2><p class="lab" style="margin:0 0 12px">Tes données sont uniquement dans ce téléphone. Fais une sauvegarde de temps en temps et garde le fichier ailleurs (Drive, mail, ordi).${D.lastBackup ? ' Dernière sauvegarde : ' + new Date(D.lastBackup).toLocaleDateString('fr-FR') + '.' : ' Aucune sauvegarde pour l\'instant.'}</p>
   <div class="grid g3"><button class="btn b-amb" id="bk">Sauvegarder</button><label class="btn b-out" for="rs" style="display:flex;align-items:center;justify-content:center;margin:0;color:var(--ink);font-size:16px">Restaurer<input id="rs" type="file" accept=".json,application/json" style="display:none"></label><button class="btn b-out" id="ex">Export tableur</button></div>
   ${st.restore ? `<div class="card" style="margin:12px 0 0;border-color:var(--red)"><p style="margin:0 0 10px">Remplacer tout le journal actuel par cette sauvegarde (${st.restore.armes.length} arme(s)) ?</p><div class="row"><button class="btn b-out" id="rsn">Annuler</button><button class="btn b-red" id="rsy">Oui, restaurer</button></div></div>` : ''}</div>
@@ -189,6 +191,7 @@ function home() {
   $('#ex').onclick = () => dl('journal-tir-series-' + new Date().toISOString().slice(0, 10) + '.csv', '\ufeff' + csv(), 'text/csv');
   $('#rs').onchange = e => { const f = e.target.files[0]; if (!f) return; f.text().then(t => { try { const o = JSON.parse(t); if (!Array.isArray(o.armes)) throw 0; st.restore = o; } catch (x) { toast('Fichier de sauvegarde invalide'); } home(); }); };
   if (st.restore) { $('#rsn').onclick = () => { st.restore = null; home(); }; $('#rsy').onclick = () => { D = st.restore; st.restore = null; save('Journal restauré'); home(); }; }
+  const ib = $('#inst'); if (ib) ib.onclick = () => { installEvt.prompt(); installEvt.userChoice.finally(() => { installEvt = null; home(); }); };
   const aa = $('#aa'); if (aa) aa.onclick = () => { st.addArme = true; home(); };
   const f = $('#fa'); if (f) { $('#acx').onclick = () => { st.addArme = false; home(); }; f.onsubmit = e => { e.preventDefault(); const id = uid(); D.armes.push({ id, nom: $('#an').value.trim(), calibre: $('#ac').value.trim(), canon: $('#ak').value.trim(), pas: num($('#ap').value) || 8, haut: num($('#ah').value) || 50, zero: num($('#az').value) || 100, coupsAvant: 0, charges: [], series: [] }); st.addArme = false; save('Arme ajoutée'); location.hash = 'a-' + id + '-journal'; }; }
 }
@@ -292,6 +295,8 @@ function stats(a) {
 
 try { navigator.storage && navigator.storage.persist && navigator.storage.persist(); } catch (e) {}
 if ('serviceWorker' in navigator && location.protocol === 'https:') navigator.serviceWorker.register('sw.js').catch(() => {});
+window.addEventListener('beforeinstallprompt', e => { e.preventDefault(); installEvt = e; if (!location.hash || location.hash === '#accueil') home(); });
+window.addEventListener('appinstalled', () => { installEvt = null; toast('Application installée'); });
 window.addEventListener('hashchange', route);
 route();
 }
