@@ -146,18 +146,40 @@ const dayFmt = d => new Date(d + 'T12:00').toLocaleDateString('fr-FR', { weekday
 const G7M = [0,.5,.6,.7,.75,.8,.85,.9,.925,.95,.975,1,1.025,1.05,1.1,1.15,1.2,1.3,1.4,1.5,1.6,1.7,1.8,1.9,2,2.2,2.4,2.6,2.8,3,4];
 const G7C = [.1198,.1194,.1194,.1202,.1215,.1242,.1306,.1464,.166,.2054,.2993,.3803,.4015,.4043,.4014,.3955,.3884,.3732,.358,.344,.3315,.3209,.3117,.3042,.298,.2864,.2752,.2643,.2533,.2424,.2424];
 function cd(m) { m = Math.min(m, 3.9); let i = 0; while (G7M[i + 1] < m) i++; return G7C[i] + (G7C[i + 1] - G7C[i]) * (m - G7M[i]) / (G7M[i + 1] - G7M[i]); }
-function solve(a, c, v0, T, P, W, H, bm = 1, dm = 1) {
-  const rho = P * 100 / (287.05 * (T + 273.15)), cs = 331.3 * Math.sqrt(1 + T / 273.15), k = rho * Math.PI / (8 * c.bc * bm * 703.0696);
-  const l = c.long / 25.4 / .264, tw = (a.pas || 8) / .264;
-  const sg = 30 * c.grains / (tw * tw * .264 ** 3 * l * (1 + l * l)) * Math.cbrt(v0 * 3.28084 / 2800) * ((T * 1.8 + 32 + 460) / 519) * (1013.25 / P);
-  const out = []; let v = v0, t = 0, vy = 0, y = 0;
-  for (let x = 0; x <= 1200; x++) {
-    out[x] = { v, t, y };
-    const v2 = v * Math.exp(-k * cd(v / cs)), dt = 2 / (v + v2);
-    const vy2 = vy * v2 / v - 9.80665 * dt; y += (vy + vy2) / 2 * dt; vy = vy2; t += dt; v = v2;
+const Z0 = { eau: .0002, neige: .001, prairie: .03, culture: .1, broussailles: .25, village: .5, foret: 1 };
+const ZN = { eau: 'Eau', neige: 'Neige / glace', prairie: 'Prairie, herbe rase', culture: 'Cultures, hautes herbes', broussailles: 'Broussailles, vergers', village: 'Village, bâtiments', foret: 'Bois, forêt' };
+/* 3D point-mass, G7, RK4 in the line-of-sight frame; wind can change along the path with the ground */
+function solve(a, c, v0, E, bm = 1, dm = 1) {
+  const T = E.T ?? 15, P = E.P || 1013, hum = E.hum ?? 50, g = 9.80665;
+  const es = 6.1078 * 10 ** (7.5 * T / (T + 237.3)), pv = hum / 100 * es;
+  const rho = ((P - pv) * 100 / 287.058 + pv * 100 / 461.495) / (T + 273.15), cs = 331.3 * Math.sqrt(1 + T / 273.15);
+  const k = rho * Math.PI / (8 * c.bc * bm * 703.0696);
+  const Lc = c.long / 25.4 / .264, tw = (a.pas || 8) / .264;
+  const sg = 30 * c.grains / (tw * tw * .264 ** 3 * Lc * (1 + Lc * Lc)) * Math.cbrt(v0 * 3.28084 / 2800) * ((T * 1.8 + 32 + 460) / 519) * (1013.25 / P);
+  const h = (a.haut || 50) / 1000, zero = Math.max(10, Math.round(a.zero || 100)), th = (E.ang || 0) * Math.PI / 180;
+  const W = E.W || 0, cl = (E.H || 3) * Math.PI / 6, wc = W * Math.sin(cl), wh = W * Math.cos(cl);
+  const zones = (E.zones || []).filter(z => z.to > 0).sort((p, q) => p.to - q.to), h0 = E.h0 ?? 1;
+  const z0s = zones.length ? Z0[zones[0].type] || .03 : .03, Lb = Math.log(60 / z0s) / Math.log(2 / z0s);
+  const wf = (x, zag) => { if (!zones.length) return 1; const zn = zones.find(z => x <= z.to) || zones[zones.length - 1], z0 = Z0[zn.type] || .03; return Lb * Math.log(Math.max(zag, .5) / z0) / Math.log(60 / z0); };
+  function run(al, xm, gx, gy, wind) {
+    const dt = .0005, out = []; let s = [0, -h, 0, v0 * Math.cos(al), v0 * Math.sin(al), 0], t = 0, nx = 1;
+    const der = S => { const f = wind ? wf(S[0], h0 + S[1]) : 0, rx = S[3] + wh * f, ry = S[4], rz = S[5] + wc * f, vr = Math.hypot(rx, ry, rz), kk = k * cd(vr / cs) * vr; return [S[3], S[4], S[5], -kk * rx + gx, -kk * ry + gy, -kk * rz]; };
+    while (s[0] < xm + 1 && t < 8) {
+      const k1 = der(s), k2 = der(s.map((v, i) => v + k1[i] * dt / 2)), k3 = der(s.map((v, i) => v + k2[i] * dt / 2)), k4 = der(s.map((v, i) => v + k3[i] * dt));
+      const s1 = s.map((v, i) => v + dt / 6 * (k1[i] + 2 * k2[i] + 2 * k3[i] + k4[i]));
+      while (nx <= s1[0] && nx <= xm) { const f = (nx - s[0]) / (s1[0] - s[0]); out[nx] = { y: s[1] + f * (s1[1] - s[1]), z: s[2] + f * (s1[2] - s[2]), t: t + f * dt, v: Math.hypot(s[3] + f * (s1[3] - s[3]), s[4] + f * (s1[4] - s[4])) }; nx++; }
+      s = s1; t += dt;
+    }
+    return out;
   }
-  const h = (a.haut || 50) / 1000, z = Math.min(1200, Math.max(10, Math.round(a.zero || 100))), th = (h - out[z].y) / z, wc = W * Math.sin(H * Math.PI / 6), lat = 48.7 * Math.PI / 180;
-  return x => { x = Math.min(1200, Math.max(1, Math.round(x))); const p = out[x]; const hf = -(p.y + x * th - h) / x * 1e4; const df = dm * (wc * (p.t - x / v0) - 1.25 * (sg + 1.2) * p.t ** 1.83 * .0254 - 7.292e-5 * x * p.t * Math.sin(lat)) / x * 1e4; return { hf, df, h: Math.round(hf), d: Math.round(df), v: p.v, e: .5 * c.grains * 6.479891e-5 * p.v ** 2, m: p.v / cs, sg }; };
+  let al = h / zero; for (let i = 0; i < 4; i++) { const o = run(al, zero, 0, -g, false); al -= o[zero].y / zero; }
+  const out = run(al, 1200, -g * Math.sin(th), -g * Math.cos(th), true);
+  const lat = (E.lat ?? 48.7) * Math.PI / 180, az = E.az === '' || E.az == null ? null : E.az * Math.PI / 180, om = 7.292115e-5;
+  const AJ = (.01 * sg - .0024 * Lc + .032) * .6508;
+  return x => { x = Math.min(1200, Math.max(1, Math.round(x))); const p = out[x] || out[out.length - 1];
+    const spin = 1.25 * (sg + 1.2) * p.t ** 1.83 * .0254, corH = om * x * p.t * Math.sin(lat), corV = az == null ? 0 : om * x * p.t * Math.cos(lat) * Math.sin(az);
+    const hf = (-(p.y + corV) / x * 1000 + AJ * wc) * 10, df = dm * (-p.z / x * 1e4) - (spin + corH) / x * 1e4;
+    return { hf, df, h: Math.round(hf), d: Math.round(df), v: p.v, e: .5 * c.grains * 6.479891e-5 * p.v ** 2, m: p.v / cs, sg, t: p.t }; };
 }
 /* what we know about a load, from the journal */
 function know(a, c) {
@@ -174,29 +196,33 @@ function know(a, c) {
   return { vref, sd, tref, sens, n: meas.reduce((t, s) => t + (+s.coups || 0), 0), shots: shots.length };
 }
 const v0At = (K, T) => K.vref + K.sens * (T - K.tref);
-/* truing: fit a BC multiplier and a drift multiplier on everything verified at the range */
+const trueMemo = {};
 function trueUp(a, c, K) {
-  const pts = (a.verifs || []).filter(v => v.charge === c.id && v.dist >= 200).map(v => ({ ...v }))
-    .concat(a.series.filter(s => s.charge === c.id && num(s.hausse) !== '' && num(s.dist) >= 200).map(s => ({ dist: num(s.dist), T: num(s.temp) === '' ? 15 : num(s.temp), P: 1013, W: 0, H: 3, realH: num(s.hausse), realD: num(s.derive) === '' ? null : num(s.derive) })));
-  if (!pts.length || !K.vref) return { dv: 0, bm: 1, dm: 1, n: 0, pts: [] };
-  const sig = p => { const f1 = solve(a, c, v0At(K, p.T) - K.sd, p.T, p.P, p.W, p.H)(p.dist), f2 = solve(a, c, v0At(K, p.T) + K.sd, p.T, p.P, p.W, p.H)(p.dist); return Math.max(.5, Math.abs(f1.hf - f2.hf) / 2); };
-  const sg = pts.map(sig);
-  const err = (set, dv, m) => set.reduce((e, i) => { const p = pts[i], f = solve(a, c, v0At(K, p.T) + dv, p.T, p.P, p.W, p.H, m)(p.dist); return e + ((f.hf - p.realH) / sg[i]) ** 2; }, 0);
+  const key = c.id + K.vref + '|' + K.sd + '|' + c.bc + JSON.stringify((a.verifs || []).filter(v => v.charge === c.id)) + JSON.stringify(a.series.filter(s => s.charge === c.id).map(s => [s.hausse, s.dist, s.temp, s.derive]));
+  if (trueMemo[key]) return trueMemo[key];
+  return (trueMemo[key] = trueUp0(a, c, K));
+}
+function trueUp0(a, c, K) {
+  const envOf = p => p.env || { T: p.T ?? 15, P: p.P || 1013, W: p.W || 0, H: p.H || 3 };
+  const pts = (a.verifs || []).filter(v => v.charge === c.id && v.dist >= 200).map(v => ({ ...v, E: envOf(v) }))
+    .concat(a.series.filter(s => s.charge === c.id && num(s.hausse) !== '' && num(s.dist) >= 200).map(s => ({ dist: num(s.dist), E: { T: num(s.temp) === '' ? 15 : num(s.temp), P: 1013, W: 0, H: 3 }, realH: num(s.hausse), realD: num(s.derive) === '' ? null : num(s.derive) })));
+  if (!pts.length || !K.vref) return { dv: 0, bm: 1, dm: 1, n: 0 };
+  const sg = pts.map(p => Math.max(.5, Math.abs(solve(a, c, v0At(K, p.E.T) - K.sd, p.E)(p.dist).hf - solve(a, c, v0At(K, p.E.T) + K.sd, p.E)(p.dist).hf) / 2));
+  const err = (set, dv, m) => set.reduce((e, i) => { const p = pts[i], f = solve(a, c, v0At(K, p.E.T) + dv, p.E, m)(p.dist); return e + ((f.hf - p.realH) / sg[i]) ** 2; }, 0);
   const near = pts.map((p, i) => i).filter(i => pts[i].dist < 600), far = pts.map((p, i) => i).filter(i => pts[i].dist >= 600);
-  /* short range errors come from the velocity (or the zero), long range ones from the BC: true them in that order, like Strelok */
-  let dv = 0, be = Infinity;
+  const search = (lo, hi, step, f) => { let b = lo, be = Infinity; for (let x = lo; x <= hi + 1e-9; x += step) { const e = f(x); if (e < be) { be = e; b = x; } } return b; };
   const setV = near.length ? near : far;
-  for (let x = -80; x <= 80; x++) { const e = err(setV, x, 1); if (e < be) { be = e; dv = x; } }
+  let dv = search(-80, 80, 4, x => err(setV, x, 1)); dv = search(dv - 4, dv + 4, 1, x => err(setV, x, 1));
   let bm = 1;
-  if (far.length && near.length) { be = Infinity; for (let m = .8; m <= 1.2001; m += .005) { const e = err(far, dv, m); if (e < be) { be = e; bm = m; } } }
+  if (far.length && near.length) { bm = search(.8, 1.2, .02, m => err(far, dv, m)); bm = search(bm - .02, bm + .02, .005, m => err(far, dv, m)); }
   let sxy = 0, sxx = 0;
-  pts.forEach(p => { if (p.realD == null) return; const f = solve(a, c, v0At(K, p.T) + dv, p.T, p.P, p.W, p.H, bm)(p.dist); if (Math.abs(f.df) >= 2) { sxy += f.df * p.realD; sxx += f.df * f.df; } });
+  pts.forEach(p => { if (p.realD == null) return; const f0 = solve(a, c, v0At(K, p.E.T) + dv, p.E, bm), f = f0(p.dist), nw = solve(a, c, v0At(K, p.E.T) + dv, { ...p.E, W: 0 }, bm)(p.dist); const wind = f.df - nw.df; if (Math.abs(wind) >= 2) { sxy += wind * (p.realD - nw.df); sxx += wind * wind; } });
   const dm = sxx ? Math.min(1.5, Math.max(.5, sxy / sxx)) : 1;
-  return { dv, bm: +bm.toFixed(3), dm: +dm.toFixed(2), n: pts.length, pts };
+  return { dv: Math.round(dv), bm: +bm.toFixed(3), dm: +dm.toFixed(2), n: pts.length };
 }
 
 /* ---------- views ---------- */
-let st = { calc: { charge: null, dist: 300, T: 15, P: 1013, W: 0, H: 3, cible: 20 }, form: null, del: null, addArme: false, addCharge: false, restore: null, ko: null, reopen: null, chk: null };
+let st = { calc: { charge: null, dist: 300, T: 15, P: 1013, W: 0, H: 3, cible: 20, hum: 50, ang: 0, az: '', lat: 48.7, h0: 1, zones: [] }, form: null, del: null, addArme: false, addCharge: false, restore: null, ko: null, reopen: null, chk: null };
 function route() {
   closeModal(true);
   const h = location.hash.slice(1);
@@ -275,6 +301,7 @@ let modalEl = null;
 function closeModal(silent) { if (modalEl) { modalEl.remove(); modalEl = null; document.body.style.overflow = ''; } }
 function openCalc(a, c) {
   closeModal(true);
+  const L = a.lastEnv || {}; Object.assign(st.calc, { hum: L.hum ?? 50, lat: L.lat ?? 48.7, h0: L.h0 ?? 1, zones: (L.zones || []).map(z => ({ ...z })), ang: 0, az: st.calc.az ?? '' });
   modalEl = document.createElement('div');
   modalEl.className = 'modal'; modalEl.setAttribute('role', 'dialog'); modalEl.setAttribute('aria-modal', 'true'); modalEl.setAttribute('aria-label', 'Calcul de tir');
   document.body.appendChild(modalEl); document.body.style.overflow = 'hidden';
@@ -353,7 +380,16 @@ function calcul(a, c) {
     <div><div class="num ${K.sd <= 4 ? 'gr' : K.sd <= 7 ? 'amb' : 'red'}" style="font-size:24px">${K.sd ? fr(K.sd) : '—'}</div><div class="lab">SD chrono (${K.shots || K.n} coups)</div></div>
     <div><div class="num ${TR.n ? 'gr' : ''}" style="font-size:24px">${TR.n ? (TR.dv > 0 ? '+' : '') + TR.dv + ' m/s' : '—'}</div><div class="lab">${TR.n ? 'recalage sur ' + TR.n + ' vérif.' : 'pas encore recalé'}</div></div></div>
     <p class="note" style="margin:8px 0 0">Vref ${fr(K.vref)} m/s à ${fr(K.tref, 0)} °C${K.sens ? ' · ' + (K.sens > 0 ? '+' : '') + fr(K.sens, 2) + ' m/s par °C (mesuré)' : ' · sensibilité T° pas encore mesurable'}${TR.n && TR.bm !== 1 ? ' · BC ×' + fr(TR.bm, 3) + ' (tirs ≥ 600 m)' : ''}${TR.n && TR.dm !== 1 ? ' · dérive ×' + fr(TR.dm, 2) : ''}</p>${Math.abs(TR.dv) > 25 ? '<p class="note amb" style="margin:6px 0 0">⚠ Gros recalage (' + (TR.dv > 0 ? '+' : '') + TR.dv + ' m/s) : vérifie aussi ton zéro et la valeur réelle d\'un clic de ta lunette.</p>' : ''}</div>
-  <div class="grid g4"><div><label for="rt">T° (°C)</label><input id="rt" inputmode="decimal" value="${C.T}"></div><div><label for="rp">hPa</label><input id="rp" inputmode="numeric" value="${C.P}"></div><div><label for="rw">Vent m/s</label><input id="rw" inputmode="decimal" value="${C.W}"></div><div><label for="rh">Heure</label><select id="rh">${[...Array(12)].map((_, i) => `<option ${C.H === i + 1 ? 'selected' : ''}>${i + 1}</option>`).join('')}</select></div></div>
+  <div class="grid g4"><div><label for="rt">T° (°C)</label><input id="rt" inputmode="decimal" value="${C.T}"></div><div><label for="rp">hPa</label><input id="rp" inputmode="numeric" value="${C.P}"></div><div><label for="ru">Humidité %</label><input id="ru" inputmode="numeric" value="${C.hum}"></div><div><label for="ra">Angle (°)</label><input id="ra" inputmode="decimal" value="${C.ang}"></div></div>
+  <div class="grid g4" style="margin-top:8px"><div><label for="rw">Vent m/s</label><input id="rw" inputmode="decimal" value="${C.W}"></div><div><label for="rh">Vient de (h)</label><select id="rh">${[...Array(12)].map((_, i) => `<option ${C.H === i + 1 ? 'selected' : ''}>${i + 1}</option>`).join('')}</select></div><div><label for="rz">Direction (°)</label><input id="rz" inputmode="numeric" value="${C.az ?? ''}" placeholder="facult."></div><div><label for="rl">Latitude</label><input id="rl" inputmode="decimal" value="${C.lat}"></div></div>
+  <div class="row" style="margin-top:8px;gap:8px"><button class="btn b-out" id="gps" style="flex:1">📍 Latitude GPS</button><button class="btn b-out" id="cmp" style="flex:1">🧭 Viser la cible</button></div>
+  <p class="note" style="margin:4px 0 0">Angle : + en montée, − en descente. Vent : 3 h = de droite, 12 h = de face. Direction = cap vers la cible (Coriolis).</p>
+
+  <div class="card" style="margin-top:14px"><h2 style="margin-bottom:4px">🌍 Terrain jusqu'à la cible</h2>
+    <p class="lab" style="margin:0 0 10px">${C.zones.length ? 'Le vent mesuré à ton poste est recalculé zone par zone, à la hauteur de la balle.' : 'Terrain uniforme : le vent est le même partout. Ajoute des zones si le sol change (eau, prairie, bois…).'}</p>
+    ${C.zones.map((z, i) => `<div class="grid g3" style="margin-bottom:8px;grid-template-columns:minmax(0,1fr) minmax(0,1.6fr) 48px"><div><label for="zt${i}">Jusqu'à (m)</label><input id="zt${i}" inputmode="numeric" value="${z.to}"></div><div><label for="zs${i}">Sol</label><select id="zs${i}">${Object.keys(ZN).map(k => `<option value="${k}" ${z.type === k ? 'selected' : ''}>${ZN[k]}</option>`).join('')}</select></div><div style="display:flex;align-items:flex-end"><button class="btn b-out" data-zx="${i}" aria-label="Supprimer la zone" style="padding:0;width:48px">✕</button></div></div>`).join('')}
+    <div class="row" style="gap:8px"><button class="btn b-out" id="zadd" style="flex:1">+ Zone</button><div style="flex:1"><label for="rg">Hauteur de tir (m)</label><input id="rg" inputmode="decimal" value="${C.h0}"></div></div>
+    <p class="note" style="margin:6px 0 0">Hauteur de tir : canon au-dessus du sol (couché ≈ 0,3, table ≈ 1,2). Le premier sol est celui de ton poste, où tu mesures le vent.</p></div>
 
   <div class="card" style="margin-top:14px;border-color:var(--amb)"><h2 style="margin-bottom:10px">🎯 Vérifier une distance</h2>
     <div class="grid g3"><div><label for="qd">Distance (m)</label><input id="qd" inputmode="numeric" value="${Q ? Q.dist : C.dist}"></div><div><label for="qc">Taille cible (cm)</label><input id="qc" inputmode="decimal" value="${Q ? Q.cible : (C.cible || 20)}"></div><div style="display:flex;align-items:flex-end"><button class="btn b-amb" id="qgo" style="width:100%">Calculer</button></div></div>
@@ -365,9 +401,12 @@ function calcul(a, c) {
   <div class="grid g3" style="margin-top:12px" id="sub"></div>
   ${done.length ? `<h2 style="margin:20px 0 8px">Vérifications</h2><div class="scroll"><table><thead><tr><th>Date</th><th>Dist.</th><th>Cible</th><th>Proposé</th><th>Réel</th><th></th></tr></thead><tbody>${done.map(v => `<tr><td>${new Date(v.date).toLocaleDateString('fr-FR')}</td><td>${v.dist} m</td><td>${v.cible ? v.cible + ' cm' : '—'}</td><td>${v.propH} / ${v.propD}</td><td>${v.realH} / ${v.realD}</td><td><button class="btn b-out" data-x="${v.id}" aria-label="Supprimer cette vérification" style="min-height:36px;padding:0 10px">✕</button></td></tr>`).join('')}</tbody></table></div>` : ''}
   <h2 style="margin:20px 0 8px">Table de tir</h2><div class="scroll"><table><thead><tr><th>Distance</th><th>Hausse</th><th>±</th><th>Dérive</th><th>m/s</th></tr></thead><tbody id="tb"></tbody></table></div>
-  <p class="note">Clics de 0,1 MRAD, dérive + = droite. « ± » = dispersion verticale due au SD de ta munition. Chaque correction « corrigée » recale le modèle : sous 600 m la vitesse, au-delà le BC, et la dérive par vent ; les « validées » le confirment.</p></div>`;
-  const cond = () => { C.T = num($('#rt').value); if (C.T === '') C.T = 15; C.P = num($('#rp').value) || 1013; C.W = num($('#rw').value) || 0; C.H = +$('#rh').value; };
-  const model = (dv0 = 0) => solve(a, c, v0At(K, C.T) + TR.dv + dv0, C.T, C.P, C.W, C.H, TR.bm, TR.dm);
+  <p class="note">Clics de 0,1 MRAD, dérive + = droite. Calcul 3D point-masse (G7), avec humidité, angle de tir, vent de travers et de face, saut aérodynamique, dérive gyroscopique, Coriolis et vent recalculé selon le terrain. « ± » = dispersion verticale due au SD de ta munition. Chaque correction recale le modèle : sous 600 m la vitesse, au-delà le BC, et la dérive par vent.</p></div>`;
+  const cond = () => { C.T = num($('#rt').value); if (C.T === '') C.T = 15; C.P = num($('#rp').value) || 1013; C.hum = num($('#ru').value); if (C.hum === '') C.hum = 50; C.ang = num($('#ra').value) || 0; C.W = num($('#rw').value) || 0; C.H = +$('#rh').value; C.az = num($('#rz').value); C.lat = num($('#rl').value); if (C.lat === '') C.lat = 48.7; C.h0 = num($('#rg').value) || 1;
+    C.zones.forEach((z, i) => { z.to = num($('#zt' + i).value) || 0; z.type = $('#zs' + i).value; }); };
+  const env = () => ({ T: C.T, P: C.P, hum: C.hum, ang: C.ang, W: C.W, H: C.H, az: C.az, lat: C.lat, h0: C.h0, zones: C.zones.map(z => ({ ...z })) });
+  const memo = {};
+  const model = (dv0 = 0) => { const key = dv0 + JSON.stringify(env()); return memo[key] || (memo[key] = solve(a, c, v0At(K, C.T) + TR.dv + dv0, env(), TR.bm, TR.dm)); };
   const pmAt = d => K.sd ? Math.abs(model(-K.sd)(d).hf - model(K.sd)(d).hf) / 2 : 0;
   const draw = () => {
     cond(); C.dist = +$('#rd').value;
@@ -385,13 +424,21 @@ function calcul(a, c) {
         <div class="verdict" style="background:${marge >= 0 ? '#163A2A' : '#3A2E10'};color:${marge >= 0 ? 'var(--gr)' : 'var(--amb)'}">${marge >= 0 ? '✓ Marge confortable' : '⚠ Cible juste pour ta munition'} : la cible fait ±${fr(half)} clic, ta dispersion verticale ±${fr(uq)} clic + l'arrondi du clic ±0,5.</div>
         ${st.ko ? `<div class="grid g2" style="margin-top:10px"><div><label for="kh">Hausse qui touche (clics)</label><input id="kh" inputmode="numeric" value="${q.h}"></div><div><label for="kd">Dérive qui touche (+ = droite)</label><input id="kd" inputmode="numeric" value="${q.d}"></div></div><button class="btn b-amb" id="qsave" style="width:100%;margin-top:10px">Enregistrer la correction</button>`
         : `<div class="grid g2" style="margin-top:10px"><button class="btn b-out" id="qok" style="border-color:var(--gr);color:var(--gr)">✓ Validé, touché</button><button class="btn b-red" id="qko">✗ Corriger</button></div>`}`;
-      const rec = (res, h, d) => { a.verifs.push({ id: uid(), charge: c.id, date: Date.now(), dist: Q.dist, cible: Q.cible, T: Q.T, P: Q.P, W: Q.W, H: Q.H, propH: Q.propH, propD: Q.propD, result: res, realH: h, realD: d }); st.chk = null; st.ko = null; save(res === 'ok' ? 'Validé : le calcul colle' : 'Modèle recalé'); calcul(a, c); };
+      const rec = (res, h, d) => { a.verifs.push({ id: uid(), charge: c.id, date: Date.now(), dist: Q.dist, cible: Q.cible, T: C.T, env: env(), propH: Q.propH, propD: Q.propD, result: res, realH: h, realD: d }); st.chk = null; st.ko = null; save(res === 'ok' ? 'Validé : le calcul colle' : 'Modèle recalé'); calcul(a, c); };
       const ok = $('#qok'); if (ok) ok.onclick = () => rec('ok', Q.propH, Q.propD);
       const ko = $('#qko'); if (ko) ko.onclick = () => { st.ko = true; draw(); };
       const sv = $('#qsave'); if (sv) sv.onclick = () => { const h = num($('#kh').value), d = num($('#kd').value); rec('ko', h === '' ? Q.propH : Math.round(h), d === '' ? Q.propD : Math.round(d)); };
     }
   };
-  ['#rd', '#rt', '#rp', '#rw', '#rh'].forEach(s => $(s).oninput = draw);
+  const sync = () => { cond(); a.lastEnv = { hum: C.hum, lat: C.lat, h0: C.h0, zones: C.zones }; };
+  ['#rd', '#rt', '#rp', '#ru', '#ra', '#rw', '#rh', '#rz', '#rl', '#rg'].forEach(s => $(s).onchange = () => { sync(); save(); draw(); });
+  $('#rd').oninput = draw;
+  C.zones.forEach((z, i) => { $('#zt' + i).onchange = $('#zs' + i).onchange = () => { sync(); save(); setTimeout(() => calcul(a, c)); }; });
+  modalEl.querySelectorAll('[data-zx]').forEach(b => b.onclick = () => { sync(); C.zones.splice(+b.dataset.zx, 1); a.lastEnv.zones = C.zones; save(); calcul(a, c); });
+  $('#zadd').onclick = () => { sync(); const last = C.zones[C.zones.length - 1]; C.zones.push({ to: last ? Math.min(1200, last.to + 200) : Math.max(100, C.dist), type: last ? (last.type === 'prairie' ? 'eau' : 'prairie') : 'prairie' }); a.lastEnv.zones = C.zones; save(); calcul(a, c); };
+  $('#gps').onclick = () => { if (!navigator.geolocation) { toast('GPS indisponible'); return; } toast('Recherche GPS…'); navigator.geolocation.getCurrentPosition(p => { $('#rl').value = p.coords.latitude.toFixed(2); sync(); save('Latitude : ' + p.coords.latitude.toFixed(2) + '°'); draw(); }, () => toast('GPS refusé ou indisponible'), { enableHighAccuracy: true, timeout: 15000 }); };
+  $('#cmp').onclick = () => { const go = () => { let n = 0; const h = e => { const hd = e.webkitCompassHeading ?? (e.absolute || e.type === 'deviceorientationabsolute' ? (360 - e.alpha) % 360 : null); if (hd == null) return; if (++n < 8) return; removeEventListener('deviceorientationabsolute', h); removeEventListener('deviceorientation', h); $('#rz').value = Math.round(hd); sync(); save('Direction : ' + Math.round(hd) + '°'); draw(); }; addEventListener('deviceorientationabsolute', h); addEventListener('deviceorientation', h); toast('Vise la cible avec le téléphone…'); setTimeout(() => { removeEventListener('deviceorientationabsolute', h); removeEventListener('deviceorientation', h); }, 8000); };
+    if (window.DeviceOrientationEvent && DeviceOrientationEvent.requestPermission) DeviceOrientationEvent.requestPermission().then(r => r === 'granted' ? go() : toast('Boussole refusée')).catch(() => toast('Boussole indisponible')); else go(); };
   $('#qgo').onclick = () => { const d = Math.round(num($('#qd').value)), t = num($('#qc').value); if (!(d >= 10 && d <= 1200) || !(t > 0)) { toast('Distance (10 à 1200 m) et taille de cible'); return; } C.cible = t; st.ko = null; st.chk = { charge: c.id, dist: d, cible: t }; calcul(a, c); };
   $('#xc').onclick = () => { st.chk = null; st.ko = null; closeModal(); };
   modalEl.querySelectorAll('[data-x]').forEach(b => b.onclick = () => { a.verifs = a.verifs.filter(v => v.id !== b.dataset.x); save(); calcul(a, c); });
