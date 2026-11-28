@@ -95,8 +95,10 @@ function cobsDec(f) {
 class W { constructor() { this.a = []; } u8(v) { this.a.push(v & 255); return this; } u16(v) { return this.u8(v).u8(v >> 8); } u32(v) { return this.u16(v & 0xFFFF).u16(v >>> 16); } u64(v) { for (let k = 0n; k < 8n; k++) this.u8(Number((v >> (8n * k)) & 255n)); return this; } str(s) { const b = new TextEncoder().encode(s); this.u8(b.length); b.forEach(x => this.u8(x)); return this; } bytes(b) { b.forEach(x => this.u8(x)); return this; } get() { return new Uint8Array(this.a); } }
 class R { constructor(u) { this.u = u; this.d = new DataView(u.buffer, u.byteOffset, u.byteLength); this.p = 0; } get left() { return this.u.length - this.p; } u8() { return this.u[this.p++]; } u16() { const v = this.d.getUint16(this.p, true); this.p += 2; return v; } u32() { const v = this.d.getUint32(this.p, true); this.p += 4; return v; } u64() { const v = this.d.getBigUint64(this.p, true); this.p += 8; return v; } str() { const n = this.u8(), s = new TextDecoder().decode(this.u.slice(this.p, this.p + n)); this.p += n; return s; } rest() { const b = this.u.slice(this.p); this.p = this.u.length; return b; } }
 
-function msg(type, payload) {
-  const len = 4 + payload.length + 2, b = new W().u16(len).u16(type).bytes(payload).get();
+function msg(type, payload, txn) {
+  const len = 4 + payload.length + 2, w = new W().u16(len);
+  if (txn != null) w.u8(type - 5000).u8(0x80 | txn); else w.u16(type);
+  const b = w.bytes(payload).get();
   const c = crc16(b); return new W().bytes(b).u16(c).get();
 }
 
@@ -113,9 +115,11 @@ function write(bytes, what) {
   });
   return q;
 }
-function sendGfdi(type, payload, label) {
-  const m = msg(type, payload), enc = cobsEnc(m);
-  log('→ ' + (label || nm(type)) + '  ' + hex(m, 32));
+let txnOut = 0, inTxn = null, compact = false;
+function sendGfdi(type, payload, label, txn) {
+  if (txn === undefined) txn = type === 5000 ? inTxn : (compact ? (txnOut = (txnOut + 1) % 32) : null);
+  const m = msg(type, payload, txn), enc = cobsEnc(m);
+  if (type !== 5000 || !/FILE_DATA/.test(label || '')) log('→ ' + (label || nm(type)) + (txn != null ? ' #' + txn : '') + '  ' + hex(m, 32));
   for (let i = 0; i < enc.length; i += 19) write(new Uint8Array([gfdi, ...enc.slice(i, i + 19)]), label);
 }
 const ack = (orig, status = 0, extra = []) => sendGfdi(5000, new W().u16(orig).u8(status).bytes(extra).get(), 'ACK ' + nm(orig));
@@ -182,9 +186,10 @@ function onMsg(m) {
   const crc = new DataView(m.buffer, m.byteOffset).getUint16(len - 2, true);
   if (crc16(m.slice(0, len - 2)) !== crc) { log('! CRC faux : ' + hex(m)); return; }
   let type = r.u16();
-  if (type & 0x8000) { const seq = (type >> 8) & 0x7F; type = (type & 0xFF) + 5000; log('(identifiant compact, séquence ' + seq + ')'); }
+  inTxn = null;
+  if (type & 0x8000) { inTxn = (type >> 8) & 0x7F; type = (type & 0xFF) + 5000; }
   const p = new R(m.slice(4, len - 2));
-  if (type !== 5004) log('← ' + nm(type) + '  ' + hex(m.slice(4, len - 2)));
+  if (type !== 5004) log('← ' + nm(type) + (inTxn != null ? ' #' + inTxn : '') + '  ' + hex(m.slice(4, len - 2)));
   try {
     if (type === 5024) return onDevInfo(p);
     if (type === 5050) return onConfig(p);
@@ -202,7 +207,7 @@ function onDevInfo(p) {
   devInfo = { proto, product, unit, sw, maxPkt, bt, name, model };
   $('#info').textContent = (name || bt) + ' · modèle ' + model + ' · produit ' + product + ' · logiciel ' + (sw / 100).toFixed(2) + ' · protocole ' + proto;
   log('infos : ' + JSON.stringify(devInfo));
-  ack(5024);
+  compact = proto >= 150; log(compact ? 'protocole 150 : requêtes avec numéro de transaction' : 'protocole classique');
   sendGfdi(5000, new W().u16(5024).u8(0).u16(150).u16(0xFFFF).u32(0xFFFFFFFF).u16(7791).u16(0xFFFF).str('Journal de tir').str('Android').str('phone').u8(Math.floor(proto / 100) === 1 ? 1 : 0).get(), 'réponse DEVICE_INFO');
   etat('le Xero a répondu, échange en cours…', 'cy');
 }
@@ -241,8 +246,7 @@ function onFileData(p) {
   const c = crc16(data, dl.crc);
   if (c !== crc) { log('! CRC bloc faux à ' + off); sendGfdi(5000, new W().u16(5004).u8(0).u8(3).u32(off).get(), 'ACK FILE_DATA (CRC)'); return; }
   dl.crc = c; dl.parts.push(data); dl.got += data.length;
-  const m = msg(5000, new W().u16(5004).u8(0).u8(0).u32(off).get()), enc = cobsEnc(m);
-  for (let i = 0; i < enc.length; i += 19) write(new Uint8Array([gfdi, ...enc.slice(i, i + 19)]));
+  sendGfdi(5000, new W().u16(5004).u8(0).u8(0).u32(off).get(), 'ACK FILE_DATA ' + off);
   if (dl.entry.type !== 'dir') etat('téléchargement ' + Math.round(100 * dl.got / dl.size) + ' %', 'cy');
   if (dl.got >= dl.size) finishDl();
 }
