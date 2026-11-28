@@ -104,7 +104,7 @@ function msg(type, payload, txn) {
 
 /* ---------- BLE state ---------- */
 let dev = null, rx = null, tx = null, txNoResp = false, gfdi = 0, buf = new Uint8Array(0), q = Promise.resolve(), devInfo = null, dl = null, regTimer = null;
-const NAMES = { 5007: 'DIRECTORY_FILTER', 5043: 'PROTOBUF', 5054: 'COMPRESSED_DATA', 5000: 'RESPONSE', 5002: 'DOWNLOAD_REQUEST', 5004: 'FILE_DATA', 5024: 'DEVICE_INFO', 5030: 'SYSTEM_EVENT', 5031: 'SUPPORTED_FILE_TYPES', 5050: 'CONFIGURATION', 5052: 'CURRENT_TIME_REQ', 5101: 'AUTH_NEGOTIATION' };
+const NAMES = { 5011: 'FIT_DEF', 5012: 'FIT_DATA', 5007: 'DIRECTORY_FILTER', 5043: 'PROTOBUF', 5054: 'COMPRESSED_DATA', 5000: 'RESPONSE', 5002: 'DOWNLOAD_REQUEST', 5004: 'FILE_DATA', 5024: 'DEVICE_INFO', 5030: 'SYSTEM_EVENT', 5031: 'SUPPORTED_FILE_TYPES', 5050: 'CONFIGURATION', 5052: 'CURRENT_TIME_REQ', 5101: 'AUTH_NEGOTIATION' };
 const nm = t => NAMES[t] || String(t);
 
 function write(bytes, what) {
@@ -115,11 +115,11 @@ function write(bytes, what) {
   });
   return q;
 }
-let txnOut = 0, inTxn = null, compact = false;
+let fitN = 0, txnOut = 0, inTxn = null, compact = false;
 function sendGfdi(type, payload, label, txn) {
   if (txn === undefined) txn = type === 5000 ? inTxn : (compact ? (txnOut = (txnOut + 1) % 32) : null);
   const m = msg(type, payload, txn), enc = cobsEnc(m);
-  if (type !== 5000 || !/FILE_DATA/.test(label || '')) log('→ ' + (label || nm(type)) + (txn != null ? ' #' + txn : '') + '  ' + hex(m, 32));
+  if (type !== 5000 || !/FILE_DATA|FIT/.test(label || '')) log('→ ' + (label || nm(type)) + (txn != null ? ' #' + txn : '') + '  ' + hex(m, 32));
   for (let i = 0; i < enc.length; i += 19) write(new Uint8Array([gfdi, ...enc.slice(i, i + 19)]), label);
 }
 const ack = (orig, status = 0, extra = []) => sendGfdi(5000, new W().u16(orig).u8(status).bytes(extra).get(), 'ACK ' + nm(orig));
@@ -189,12 +189,13 @@ function onMsg(m) {
   inTxn = null;
   if (type & 0x8000) { inTxn = (type >> 8) & 0x7F; type = (type & 0xFF) + 5000; }
   const p = new R(m.slice(4, len - 2));
-  if (type !== 5004) log('← ' + nm(type) + (inTxn != null ? ' #' + inTxn : '') + '  ' + hex(m.slice(4, len - 2)));
+  if (type !== 5004 && type !== 5011 && type !== 5012) log('← ' + nm(type) + (inTxn != null ? ' #' + inTxn : '') + '  ' + hex(m.slice(4, len - 2)));
   try {
     if (type === 5024) return onDevInfo(p);
     if (type === 5050) return onConfig(p);
     if (type === 5000) return onResponse(p);
     if (type === 5004) return onFileData(p);
+    if (type === 5011 || type === 5012) { fitN++; log('FIT ' + (type === 5011 ? 'définition' : 'donnée') + ' ' + hex(m.slice(4, len - 2), 400)); sendGfdi(5000, new W().u16(type).u8(0).u8(0).get(), 'ACK FIT'); etat(fitN + ' messages FIT reçus', 'ok'); return; }
     if (type === 5043) { const rid = p.u16(), off = p.u32(); sendGfdi(5000, new W().u16(5043).u8(0).u16(rid).u32(off).u8(0).u8(0).get(), 'ACK PROTOBUF'); return; }
     if (type === 5052) { const ref = p.u32(), now = Math.floor(Date.now() / 1000), tz = -new Date().getTimezoneOffset() * 60; sendGfdi(5000, new W().u16(5052).u8(0).u32(ref).u32(now - GEPOCH).u32(tz).u32(0).u32(0).get(), 'HEURE'); return; }
     if (type === 5101) { const unk = p.u8(), flags = p.u32(); ack(5101, 0, new W().u8(0).u8(unk).u32(flags).get()); return; }
