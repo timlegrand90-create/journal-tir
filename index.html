@@ -223,8 +223,13 @@ function trueUp0(a, c, K) {
 
 /* ---------- views ---------- */
 let st = { calc: { charge: null, dist: 300, T: 15, P: 1013, W: 0, H: 3, cible: 20, hum: 50, ang: 0, az: '', lat: 48.7, h0: 1, zones: [] }, form: null, del: null, addArme: false, addCharge: false, restore: null, ko: null, reopen: null, chk: null };
+function takeShare() {
+  if (!('caches' in window)) return Promise.resolve(null);
+  return caches.open('partage').then(c => c.keys().then(ks => Promise.all(ks.map(k => c.match(k).then(r => { const name = decodeURIComponent(k.url.split('/').pop()); return /\.fit$/i.test(name) ? r.arrayBuffer().then(b => { try { return parseFit(b); } catch (x) { return null; } }) : r.text().then(parseCsv); }))).then(list => Promise.all(ks.map(k => c.delete(k))).then(() => list.filter(Boolean)))));
+}
 function route() {
   closeModal(true);
+  if (location.hash === '#partage') { takeShare().then(list => { if (!list || !list.length) { toast('Rien à importer dans ce partage'); location.hash = 'accueil'; return; } st.fitList = list; st.form = null; if (D.armes.length === 1) location.hash = 'a-' + D.armes[0].id + '-serie'; else { location.hash = 'accueil'; } }); return; }
   const h = location.hash.slice(1);
   let m = h.match(/^a-([a-z0-9]+)(?:-(charges|serie|journal))?$/), mc = h.match(/^a-([a-z0-9]+)-c-([a-z0-9]+)$/);
   const id = (m || mc || [])[1];
@@ -359,8 +364,9 @@ function head(a, title) { return `<div class="top"><a class="back" href="#accuei
 
 function home() {
   tabs.hidden = true;
-  app.innerHTML = `<div class="top"><div><h1>Mes armes</h1><div class="sub">Journal de tir · enregistré dans ce téléphone</div></div></div>
-  ${D.armes.map(a => { const last = sorted(a).pop(); return `<a class="card arme" href="#a-${a.id}-charges" style="color:inherit;text-decoration:none">
+  const shareBanner = st.fitList && D.armes.length > 1 ? `<div class="card" style="border-color:var(--cy)"><b class="cy">Séance du chrono reçue</b><p class="lab" style="margin:4px 0 0">Touche l'arme concernée pour créer la série.</p></div>` : '';
+  app.innerHTML = shareBanner + `<div class="top"><div><h1>Mes armes</h1><div class="sub">Journal de tir · enregistré dans ce téléphone</div></div></div>
+  ${D.armes.map(a => { const last = sorted(a).pop(); return `<a class="card arme" href="#a-${a.id}-${st.fitList ? 'serie' : 'charges'}" style="color:inherit;text-decoration:none">
     <div class="row"><div><h2>${esc(a.nom)}</h2><div class="lab">${[a.calibre, a.canon, 'pas 1:' + a.pas].filter(Boolean).map(esc).join(' · ')}</div></div><span class="num amb" style="font-size:34px">${total(a)}</span></div>
     <div class="row" style="margin-top:8px"><span class="lab">${last ? 'Dernière séance : ' + dayFmt(last.date) : 'Pas encore de séance'}</span><span class="lab">coups</span></div></a>`; }).join('')}
   ${st.addArme ? `<form class="card" id="fa"><h2 style="margin-bottom:12px">Nouvelle arme</h2>
@@ -412,6 +418,7 @@ function serie(a) {
     if (x.grains) { const c = a.charges.find(k => k.id === f.charge); if (c && Math.abs((c.grains || 0) - x.grains) > 1) { const m = a.charges.filter(k => Math.abs((k.grains || 0) - x.grains) <= 1); if (m.length === 1) f.charge = m[0].id; else toast('Le chrono était réglé sur ' + fr(x.grains) + ' gr : vérifie la charge'); } }
     st.fitList = null; serie(a); };
   app.querySelectorAll('[data-fit]').forEach(b => b.onclick = () => { keep(); useSes(st.fitList[+b.dataset.fit]); });
+  if (st.fitList && st.fitList.length === 1) { keep(); useSes(st.fitList[0]); return; }
   $('#csv').onchange = e => { const files = [...e.target.files]; if (!files.length) return; keep();
     Promise.all(files.map(fl => /\.fit$/i.test(fl.name) ? fl.arrayBuffer().then(b => { try { return parseFit(b); } catch (x) { return null; } }) : fl.text().then(parseCsv))).then(list => { list = list.filter(Boolean).sort((p, q) => ((q.date || '') + (q.heure || '')).localeCompare((p.date || '') + (p.heure || '')));
       if (!list.length) { toast('Aucune vitesse trouvée dans ce fichier'); return; }

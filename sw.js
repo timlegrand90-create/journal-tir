@@ -1,13 +1,24 @@
-const CACHE = 'journal-tir-v8';
+const CACHE = 'journal-tir-v9';
 const CORE = ['./', './index.html', './manifest.webmanifest', './icon-192.png', './icon-512.png'];
 self.addEventListener('install', e => {
   e.waitUntil(caches.open(CACHE).then(c => c.addAll(CORE)).then(() => self.skipWaiting()));
 });
 self.addEventListener('activate', e => {
-  e.waitUntil(caches.keys().then(ks => Promise.all(ks.filter(k => k !== CACHE).map(k => caches.delete(k)))).then(() => self.clients.claim()));
+  e.waitUntil(caches.keys().then(ks => Promise.all(ks.filter(k => k !== CACHE && k !== 'partage').map(k => caches.delete(k)))).then(() => self.clients.claim()));
 });
 self.addEventListener('fetch', e => {
   const req = e.request;
+  if (req.method === 'POST' && new URL(req.url).pathname.endsWith('/share')) {
+    e.respondWith((async () => {
+      const fd = await req.formData(), c = await caches.open('partage');
+      for (const k of await c.keys()) await c.delete(k);
+      let i = 0;
+      for (const f of fd.getAll('files')) if (f && f.size) await c.put('./partage/' + (i++) + '/' + encodeURIComponent(f.name || 'chrono.csv'), new Response(f));
+      const t = fd.get('text'); if (t && !i) await c.put('./partage/0/texte.csv', new Response(String(t)));
+      return Response.redirect('./#partage', 303);
+    })());
+    return;
+  }
   if (req.method !== 'GET') return;
   const url = new URL(req.url);
   if (url.origin === location.origin) {
