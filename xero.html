@@ -304,7 +304,7 @@ function onPullResp(m) {
   const res = g(1) || 0, th = g(3), cw = g(7);
   log('réponse : résultat ' + res + ', transport ' + g(2) + ', poignée ' + th + (cw ? ', compression ' + cw : ''));
   if (res !== 0 || th == null) { etat('le Xero refuse la séance (code ' + res + ')', 'ko'); return; }
-  pipe = { code: 0x2018, th, dir: 1, got: [], n: 0, cfg: false, size: pullItem.size };
+  pipe = { code: 0x2018, th, dir: 0, tried: 0, got: [], n: 0, cfg: false, size: pullItem.size };
   write(new W().u8(0).u8(0).u64(CLIENT_ID).u16(pipe.code).u8(0).get(), 'REGISTER pipe');
   log('→ handle 0 : ouvrir le canal de transfert (service ' + pipe.code + ')');
 }
@@ -316,7 +316,7 @@ function onPipe(u) {
   if (!pipe.cfg) {
     log('← transfert config ' + hex(u));
     if (u[0] === 0 && u[1] === 0 && u[2] === 0) { pipe.cfg = true; etat('réception…', 'cy'); return; }
-    if (u[0] === 0 && u[2] === 2 && pipe.dir === 1) { pipe.dir = 0; return pipeConfigure(); }
+    if (u[0] === 0 && u[2] === 2 && !pipe.tried) { pipe.tried = 1; pipe.dir = 1 - pipe.dir; log('mauvais sens, nouvel essai'); write(new W().u8(0).u8(2).u64(CLIENT_ID).u16(pipe.code).u8(pipe.h).get()); setTimeout(() => write(new W().u8(0).u8(0).u64(CLIENT_ID).u16(pipe.code).u8(0).get()), 300); return; }
     return pipeFail();
   }
   pipe.got.push(u); pipe.n += u.length;
@@ -414,7 +414,7 @@ $('#go').onclick = connect;
 $('#dir').onclick = () => { if (gfdi) itemList(); };
 $('#stop').onclick = () => { if (dev && dev.gatt.connected) dev.gatt.disconnect(); };
 $('#copy').onclick = () => { navigator.clipboard.writeText(logEl.value).then(() => { $('#copy').textContent = 'Copié'; setTimeout(() => $('#copy').textContent = 'Copier', 1500); }); };
-log('prêt (version 7) · ' + navigator.userAgent.replace(/^.*?\(/, '(').slice(0, 80));
+log('prêt (version 8) · ' + navigator.userAgent.replace(/^.*?\(/, '(').slice(0, 80));
 </script>
 </body>
 </html>
