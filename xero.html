@@ -364,7 +364,7 @@ $('#go').onclick = connect;
 $('#dir').onclick = () => { if (gfdi) itemList(); };
 $('#stop').onclick = () => { if (dev && dev.gatt.connected) dev.gatt.disconnect(); };
 $('#copy').onclick = () => { navigator.clipboard.writeText(logEl.value).then(() => { $('#copy').textContent = 'Copié'; setTimeout(() => $('#copy').textContent = 'Copier', 1500); }); };
-log('prêt · ' + navigator.userAgent.replace(/^.*?\(/, '(').slice(0, 80));
+log('prêt (version 6) · ' + navigator.userAgent.replace(/^.*?\(/, '(').slice(0, 80));
 </script>
 </body>
 </html>
