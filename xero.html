@@ -237,8 +237,10 @@ function sendProto(smart, label) {
   const id = (pbReq = (pbReq + 1) & 0xFFFF);
   sendGfdi(5043, new W().u16(id).u32(0).u32(smart.length).u32(smart.length).bytes(smart).get(), label || 'PROTOBUF requête ' + id);
 }
-function itemList() {
-  const req = [...pbVar(1, 1), ...pbVar(3, 100)];               // ItemListRequest {session_id:1, max_item_count:100}
+let s2 = null;
+function itemList(sess, txn) {
+  const req = sess ? [...pbVar(1, sess), ...pbVar(2, txn || 0), ...pbVar(3, 50)] : [...pbVar(3, 50)];   // ItemListRequest
+  if (!sess) s2 = [];
   sendProto(pbField(43, pbField(9, req)), 'SYNC2 liste des séances');
   etat('demande de la liste (Sync 2)…', 'cy');
 }
@@ -269,10 +271,14 @@ function onProto(type, p) {
   if (fa) { const il = fa.m.find(e => e.f === 10 && e.m); if (il) showItems(il.m); }
 }
 function showItems(m) {
-  const st = m.find(e => e.f === 1); const items = m.filter(e => e.f === 4 && e.m);
-  log('liste Sync 2 : statut ' + (st ? st.v : 0) + ', ' + items.length + ' éléments');
-  etat(items.length + ' éléments sur le Xero (Sync 2)', items.length ? 'ok' : 'cy');
-  files = items.map(it => { const uid = it.m.find(e => e.f === 1); const dt = it.m.find(e => e.f === 2); const sz = it.m.find(e => e.f === 3);
+  const st = m.find(e => e.f === 1), sid = m.find(e => e.f === 2), nxt = m.find(e => e.f === 3); const items = m.filter(e => e.f === 4 && e.m);
+  if (st && Number(st.v) !== 0) { log('! liste refusée, statut ' + st.v); etat('liste refusée (statut ' + st.v + ')', 'ko'); return; }
+  (s2 = s2 || []).push(...items);
+  if (items.length && sid && nxt && s2.length < 1000) { log('suite de la liste…'); return itemList(Number(sid.v), Number(nxt.v)); }
+  const all = s2;
+  log('liste Sync 2 : ' + all.length + ' éléments');
+  etat(all.length + ' éléments sur le Xero (Sync 2)', all.length ? 'ok' : 'cy');
+  files = all.map(it => { const uid = it.m.find(e => e.f === 1); const dt = it.m.find(e => e.f === 2); const sz = it.m.find(e => e.f === 3);
     return { sync2: true, uidRaw: uid && uid.raw, dtRaw: dt && dt.raw, size: sz ? Number(sz.v) : 0, label: dt && dt.m ? pbStr(dt.m).replace(/\n/g, ' ') : '?' }; });
   $('#filesCard').hidden = false;
   $('#files').innerHTML = files.map(f => '<div class="f"><div><b>' + f.label + '</b><span class="mut">' + (f.size / 1024).toFixed(1) + ' ko</span></div></div>').join('') || '<p class="mut">Aucun élément.</p>';
