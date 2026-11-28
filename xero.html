@@ -165,6 +165,7 @@ function setBtns(on) { $('#go').disabled = on; $('#stop').disabled = !on; $('#di
 function onData(u) {
   const h = u[0];
   if (h === 0) return onMgmt(new R(u.slice(1)));
+  if (pipe && h === pipe.h) return onPipe(u.slice(1));
   if (h !== gfdi || !gfdi) { log('← handle ' + h + ' : ' + hex(u)); return; }
   const n = new Uint8Array(buf.length + u.length - 1); n.set(buf); n.set(u.slice(1), buf.length); buf = n;
   for (;;) {
@@ -182,6 +183,7 @@ function onMgmt(r) {
   if (type === 6) { clearTimeout(regTimer); register(); }
   else if (type === 1) {
     const svc = r.u16(), st = r.u8(), hd = r.left ? r.u8() : 0;
+    if (pipe && svc === pipe.code) { if (st === 0) { pipe.h = hd; log('canal de transfert ouvert, handle ' + hd); pipeConfigure(); } else { log('! canal de transfert refusé, statut ' + st); pipeFail(); } return; }
     if (svc === 1 && st === 0) { gfdi = hd; log('canal GFDI ouvert, handle ' + hd); etat('canal ouvert, attente du Xero…', 'cy'); setTimeout(() => { if (!devInfo) log('! le Xero n’a pas envoyé ses infos'); }, 6000); }
     else { log('! ouverture refusée (service ' + svc + ', statut ' + st + ')'); etat('le Xero refuse le canal', 'ko'); }
   }
@@ -268,7 +270,11 @@ function onProto(type, p) {
   let t; try { t = pbDecode(all); } catch (e) { log('! protobuf illisible ' + hex(all, 64)); return; }
   log('protobuf ' + (type === 5044 ? 'réponse' : 'requête') + ' #' + rid + ' :\n' + pbStr(t));
   const fa = t.find(e => e.f === 43 && e.m);
-  if (fa) { const il = fa.m.find(e => e.f === 10 && e.m); if (il) showItems(il.m); }
+  if (fa) {
+    const il = fa.m.find(e => e.f === 10 && e.m); if (il) showItems(il.m);
+    const pr = fa.m.find(e => e.f === 2); if (pr) onPullResp(pr.m || []);
+    const ts = fa.m.find(e => e.f === 5); if (ts && type === 5043) { log('statut de transfert reçu'); const r = pbField(43, pbField(21, [])); sendGfdi(5044, new W().u16(rid).u32(0).u32(r.length).u32(r.length).bytes(r).get(), 'SYNC2 statut OK'); if (pipe && pipe.n >= pipe.size) pipeDone(); }
+  }
 }
 function showItems(m) {
   const st = m.find(e => e.f === 1), sid = m.find(e => e.f === 2), nxt = m.find(e => e.f === 3); const items = m.filter(e => e.f === 4 && e.m);
@@ -278,11 +284,54 @@ function showItems(m) {
   const all = s2;
   log('liste Sync 2 : ' + all.length + ' éléments');
   etat(all.length + ' éléments sur le Xero (Sync 2)', all.length ? 'ok' : 'cy');
-  files = all.map(it => { const uid = it.m.find(e => e.f === 1); const dt = it.m.find(e => e.f === 2); const sz = it.m.find(e => e.f === 3);
-    return { sync2: true, uidRaw: uid && uid.raw, dtRaw: dt && dt.raw, size: sz ? Number(sz.v) : 0, label: dt && dt.m ? pbStr(dt.m).replace(/\n/g, ' ') : '?' }; });
-  $('#filesCard').hidden = false;
-  $('#files').innerHTML = files.map(f => '<div class="f"><div><b>' + f.label + '</b><span class="mut">' + (f.size / 1024).toFixed(1) + ' ko</span></div></div>').join('') || '<p class="mut">Aucun élément.</p>';
+  files = all.map((it, i) => { const uid = it.m.find(e => e.f === 1), sz = it.m.find(e => e.f === 3), dt = it.m.find(e => e.f === 2);
+    const msb = uid && uid.m ? (uid.m.find(e => e.f === 1) || {}).x64 : null; const ts = msb ? Number(msb >> 32n) : 0;
+    const special = dt && dt.m && dt.m.some(e => e.f === 2);
+    return { sync2: true, index: i, raw: it.raw, size: sz ? Number(sz.v) : 0, date: ts > 600000000 ? new Date((ts + GEPOCH) * 1000) : null, special }; })
+    .filter(f => !f.special);
+  renderFiles();
 }
+let pipe = null, pullItem = null;
+function pull(f) {
+  if (pipe) { log('! transfert déjà en cours'); return; }
+  pullItem = f; f.data = null;
+  const req = [...pbField(1, [...f.raw]), ...pbVar(2, 30), ...pbVar(3, 0), ...pbVar(4, 0)];
+  sendProto(pbField(43, pbField(1, req)), 'SYNC2 demande de la séance ' + f.index);
+  etat('demande de la séance…', 'cy');
+}
+function onPullResp(m) {
+  const g = n => { const e = m.find(x => x.f === n); return e ? Number(e.v) : null; };
+  const res = g(1) || 0, th = g(3), cw = g(7);
+  log('réponse : résultat ' + res + ', transport ' + g(2) + ', poignée ' + th + (cw ? ', compression ' + cw : ''));
+  if (res !== 0 || th == null) { etat('le Xero refuse la séance (code ' + res + ')', 'ko'); return; }
+  pipe = { code: 0x2018, th, dir: 1, got: [], n: 0, cfg: false, size: pullItem.size };
+  write(new W().u8(0).u8(0).u64(CLIENT_ID).u16(pipe.code).u8(0).get(), 'REGISTER pipe');
+  log('→ handle 0 : ouvrir le canal de transfert (service ' + pipe.code + ')');
+}
+function pipeConfigure() {
+  const c = new W().u8(pipe.h).u8(0).u8(pipe.dir).u32(pipe.th).get();
+  log('→ transfert : configuration, sens ' + pipe.dir); write(c, 'pipe config');
+}
+function onPipe(u) {
+  if (!pipe.cfg) {
+    log('← transfert config ' + hex(u));
+    if (u[0] === 0 && u[1] === 0 && u[2] === 0) { pipe.cfg = true; etat('réception…', 'cy'); return; }
+    if (u[0] === 0 && u[2] === 2 && pipe.dir === 1) { pipe.dir = 0; return pipeConfigure(); }
+    return pipeFail();
+  }
+  pipe.got.push(u); pipe.n += u.length;
+  etat('réception ' + Math.min(100, Math.round(100 * pipe.n / pipe.size)) + ' %', 'cy');
+  if (pipe.n >= pipe.size) pipeDone();
+}
+function pipeDone() {
+  if (!pipe) return;
+  const all = new Uint8Array(pipe.n); let o = 0; for (const x of pipe.got) { all.set(x, o); o += x.length; }
+  const f = pullItem; f.data = all; f.isFit = all.length > 12 && String.fromCharCode(...all.slice(8, 12)) === '.FIT';
+  log('séance reçue : ' + all.length + ' octets, ' + (f.isFit ? 'fichier FIT valide' : 'début ' + hex(all, 24)));
+  write(new W().u8(0).u8(2).u64(CLIENT_ID).u16(pipe.code).u8(pipe.h).get(), 'CLOSE pipe');
+  pipe = null; etat(f.isFit ? 'séance reçue' : 'données reçues (format inconnu)', f.isFit ? 'ok' : 'cy'); renderFiles();
+}
+function pipeFail() { pipe = null; etat('transfert impossible', 'ko'); }
 function listDir() { filterPending = true; sendGfdi(5007, new Uint8Array([0]), 'DIRECTORY_FILTER aucun'); }
 let filterPending = false;
 function startDl(entry) {
@@ -339,11 +388,12 @@ function renderFiles() {
   const box = $('#files'); box.innerHTML = '';
   if (!files.length) { box.innerHTML = '<p class="mut">Aucun fichier.</p>'; return; }
   [...files].sort((a, b) => (b.date || 0) - (a.date || 0)).forEach(f => {
-    const d = document.createElement('div'); d.className = 'f';
-    const lab = TYPES[f.dt + '/' + f.sub] || 'Type ' + f.dt + '/' + f.sub;
+    if (f.sync2 && f.index == null) return;
+    const d = document.createElement('div'); d.className = 'f'; if (f.sync2 && f.index == null) return;
+    const lab = f.sync2 ? 'Séance' : (TYPES[f.dt + '/' + f.sub] || 'Type ' + f.dt + '/' + f.sub);
     d.innerHTML = '<div><b>' + lab + ' n°' + f.index + '</b><span class="mut">' + (f.date ? f.date.toLocaleString('fr-FR') : 'sans date') + ' · ' + (f.size / 1024).toFixed(1) + ' ko</span></div>';
     const bs = document.createElement('div'); bs.className = 'btns';
-    if (!f.data) { const b = document.createElement('button'); b.className = 'sec'; b.textContent = 'Lire'; b.onclick = () => startDl(f); bs.append(b); }
+    if (!f.data) { const b = document.createElement('button'); b.className = 'sec'; b.textContent = 'Lire'; b.onclick = () => f.sync2 ? pull(f) : startDl(f); bs.append(b); }
     else {
       if (f.isFit) { const b = document.createElement('button'); b.textContent = 'Importer'; b.onclick = () => importFit(f); bs.append(b); }
       const s = document.createElement('button'); s.className = 'sec'; s.textContent = 'Enregistrer'; s.onclick = () => saveFile(f); bs.append(s);
@@ -364,7 +414,7 @@ $('#go').onclick = connect;
 $('#dir').onclick = () => { if (gfdi) itemList(); };
 $('#stop').onclick = () => { if (dev && dev.gatt.connected) dev.gatt.disconnect(); };
 $('#copy').onclick = () => { navigator.clipboard.writeText(logEl.value).then(() => { $('#copy').textContent = 'Copié'; setTimeout(() => $('#copy').textContent = 'Copier', 1500); }); };
-log('prêt (version 6) · ' + navigator.userAgent.replace(/^.*?\(/, '(').slice(0, 80));
+log('prêt (version 7) · ' + navigator.userAgent.replace(/^.*?\(/, '(').slice(0, 80));
 </script>
 </body>
 </html>
