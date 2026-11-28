@@ -104,7 +104,7 @@ function msg(type, payload, txn) {
 
 /* ---------- BLE state ---------- */
 let dev = null, rx = null, tx = null, txNoResp = false, gfdi = 0, buf = new Uint8Array(0), q = Promise.resolve(), devInfo = null, dl = null, regTimer = null;
-const NAMES = { 5011: 'FIT_DEF', 5012: 'FIT_DATA', 5007: 'DIRECTORY_FILTER', 5043: 'PROTOBUF', 5054: 'COMPRESSED_DATA', 5000: 'RESPONSE', 5002: 'DOWNLOAD_REQUEST', 5004: 'FILE_DATA', 5024: 'DEVICE_INFO', 5030: 'SYSTEM_EVENT', 5031: 'SUPPORTED_FILE_TYPES', 5050: 'CONFIGURATION', 5052: 'CURRENT_TIME_REQ', 5101: 'AUTH_NEGOTIATION' };
+const NAMES = { 5044: 'PROTOBUF_RESP', 5011: 'FIT_DEF', 5012: 'FIT_DATA', 5007: 'DIRECTORY_FILTER', 5043: 'PROTOBUF', 5054: 'COMPRESSED_DATA', 5000: 'RESPONSE', 5002: 'DOWNLOAD_REQUEST', 5004: 'FILE_DATA', 5024: 'DEVICE_INFO', 5030: 'SYSTEM_EVENT', 5031: 'SUPPORTED_FILE_TYPES', 5050: 'CONFIGURATION', 5052: 'CURRENT_TIME_REQ', 5101: 'AUTH_NEGOTIATION' };
 const nm = t => NAMES[t] || String(t);
 
 function write(bytes, what) {
@@ -124,7 +124,15 @@ function sendGfdi(type, payload, label, txn) {
 }
 const ack = (orig, status = 0, extra = []) => sendGfdi(5000, new W().u16(orig).u8(status).bytes(extra).get(), 'ACK ' + nm(orig));
 
+let busy = false;
+const onNotif = e => { const v = e.target.value; onData(new Uint8Array(v.buffer.slice(v.byteOffset, v.byteOffset + v.byteLength))); };
 async function connect() {
+  if (busy) return; busy = true; $('#go').disabled = true;
+  try { await connect2(); } finally { busy = false; if (!tx) $('#go').disabled = false; }
+}
+async function connect2() {
+  if (dev && dev.gatt.connected) dev.gatt.disconnect();
+  buf = new Uint8Array(0); gfdi = 0; devInfo = null; dl = null;
   if (!navigator.bluetooth) { etat('Bluetooth web indisponible : ouvre cette page dans Chrome Android', 'ko'); return; }
   try {
     etat('choix de l’appareil…');
@@ -142,7 +150,7 @@ async function connect() {
     }
     if (!tx) { etat('canal Garmin absent', 'ko'); log('! aucune paire 281x/282x'); return; }
     txNoResp = !!tx.properties.writeWithoutResponse;
-    rx.addEventListener('characteristicvaluechanged', e => onData(new Uint8Array(e.target.value.buffer.slice(e.target.value.byteOffset, e.target.value.byteOffset + e.target.value.byteLength))));
+    rx.removeEventListener('characteristicvaluechanged', onNotif); rx.addEventListener('characteristicvaluechanged', onNotif);
     await rx.startNotifications(); log('notifications actives sur ' + rx.uuid.slice(4, 8) + ', écriture sur ' + tx.uuid.slice(4, 8) + (txNoResp ? ' (sans réponse)' : ''));
     setBtns(true);
     etat('négociation…', 'cy');
@@ -196,7 +204,7 @@ function onMsg(m) {
     if (type === 5000) return onResponse(p);
     if (type === 5004) return onFileData(p);
     if (type === 5011 || type === 5012) { fitN++; log('FIT ' + (type === 5011 ? 'définition' : 'donnée') + ' ' + hex(m.slice(4, len - 2), 400)); sendGfdi(5000, new W().u16(type).u8(0).u8(0).get(), 'ACK FIT'); etat(fitN + ' messages FIT reçus', 'ok'); return; }
-    if (type === 5043) { const rid = p.u16(), off = p.u32(); sendGfdi(5000, new W().u16(5043).u8(0).u16(rid).u32(off).u8(0).u8(0).get(), 'ACK PROTOBUF'); return; }
+    if (type === 5043 || type === 5044) return onProto(type, p);
     if (type === 5052) { const ref = p.u32(), now = Math.floor(Date.now() / 1000), tz = -new Date().getTimezoneOffset() * 60; sendGfdi(5000, new W().u16(5052).u8(0).u32(ref).u32(now - GEPOCH).u32(tz).u32(0).u32(0).get(), 'HEURE'); return; }
     if (type === 5101) { const unk = p.u8(), flags = p.u32(); ack(5101, 0, new W().u8(0).u8(unk).u32(flags).get()); return; }
     log('(message ' + type + ' ignoré)');
@@ -218,7 +226,56 @@ function onConfig(p) {
   sendGfdi(5050, new W().u8(caps.length).bytes(caps).get(), 'CONFIGURATION (copie)');
   sendGfdi(5030, new W().u8(8).u8(0).get(), 'SYSTEM_EVENT sync_ready');
   etat('connecté', 'ok');
-  setTimeout(listDir, 400);
+  setTimeout(itemList, 400);
+}
+/* ---------- Sync 2 : GDI FileAccess (protobuf, Smart field 43) ---------- */
+const varint = v => { const o = []; v = BigInt(v); do { let b = Number(v & 0x7Fn); v >>= 7n; if (v) b |= 0x80; o.push(b); } while (v); return o; };
+const pbField = (n, bytes) => [...varint(n * 8 + 2), ...varint(bytes.length), ...bytes];
+const pbVar = (n, v) => [...varint(n * 8), ...varint(v)];
+let pbReq = 0, pbIn = {};
+function sendProto(smart, label) {
+  const id = (pbReq = (pbReq + 1) & 0xFFFF);
+  sendGfdi(5043, new W().u16(id).u32(0).u32(smart.length).u32(smart.length).bytes(smart).get(), label || 'PROTOBUF requête ' + id);
+}
+function itemList() {
+  const req = [...pbVar(1, 1), ...pbVar(3, 100)];               // ItemListRequest {session_id:1, max_item_count:100}
+  sendProto(pbField(43, pbField(9, req)), 'SYNC2 liste des séances');
+  etat('demande de la liste (Sync 2)…', 'cy');
+}
+function pbDecode(u, depth = 0) {
+  const out = []; let p = 0;
+  const rv = () => { let r = 0n, s = 0n, b; do { b = u[p++]; r |= BigInt(b & 0x7F) << s; s += 7n; } while (b & 0x80); return r; };
+  while (p < u.length) {
+    const key = Number(rv()), f = key >> 3, wt = key & 7;
+    if (wt === 0) out.push({ f, v: rv() });
+    else if (wt === 1) { out.push({ f, x64: new DataView(u.buffer, u.byteOffset + p, 8).getBigUint64(0, true) }); p += 8; }
+    else if (wt === 5) { out.push({ f, x32: new DataView(u.buffer, u.byteOffset + p, 4).getUint32(0, true) }); p += 4; }
+    else if (wt === 2) { const n = Number(rv()), b = u.slice(p, p + n); p += n; let sub = null; if (depth < 8) try { sub = pbDecode(b, depth + 1); } catch (e) {} out.push(sub && sub.length ? { f, m: sub, raw: b } : { f, b }); }
+    else throw new Error('wt ' + wt);
+  }
+  return out;
+}
+const pbStr = (t, ind = '') => t.map(e => ind + e.f + ': ' + (e.m ? '{\n' + pbStr(e.m, ind + '  ') + '\n' + ind + '}' : e.b ? (/^[\x20-\x7e]+$/.test(new TextDecoder().decode(e.b)) ? '"' + new TextDecoder().decode(e.b) + '"' : hex(e.b, 64)) : String(e.v ?? e.x64 ?? e.x32))).join('\n');
+function onProto(type, p) {
+  const rid = p.u16(), off = p.u32(), total = p.u32(), n = p.u32(), data = p.u.slice(p.p, p.p + n);
+  sendGfdi(5000, new W().u16(type).u8(0).u16(rid).u32(off).u8(0).u8(0).get(), 'ACK PROTOBUF ' + rid);
+  const k = type + ':' + rid; const prev = pbIn[k] || new Uint8Array(0);
+  const all = new Uint8Array(prev.length + data.length); all.set(prev); all.set(data, prev.length);
+  if (all.length < total) { pbIn[k] = all; return; }
+  delete pbIn[k];
+  let t; try { t = pbDecode(all); } catch (e) { log('! protobuf illisible ' + hex(all, 64)); return; }
+  log('protobuf ' + (type === 5044 ? 'réponse' : 'requête') + ' #' + rid + ' :\n' + pbStr(t));
+  const fa = t.find(e => e.f === 43 && e.m);
+  if (fa) { const il = fa.m.find(e => e.f === 10 && e.m); if (il) showItems(il.m); }
+}
+function showItems(m) {
+  const st = m.find(e => e.f === 1); const items = m.filter(e => e.f === 4 && e.m);
+  log('liste Sync 2 : statut ' + (st ? st.v : 0) + ', ' + items.length + ' éléments');
+  etat(items.length + ' éléments sur le Xero (Sync 2)', items.length ? 'ok' : 'cy');
+  files = items.map(it => { const uid = it.m.find(e => e.f === 1); const dt = it.m.find(e => e.f === 2); const sz = it.m.find(e => e.f === 3);
+    return { sync2: true, uidRaw: uid && uid.raw, dtRaw: dt && dt.raw, size: sz ? Number(sz.v) : 0, label: dt && dt.m ? pbStr(dt.m).replace(/\n/g, ' ') : '?' }; });
+  $('#filesCard').hidden = false;
+  $('#files').innerHTML = files.map(f => '<div class="f"><div><b>' + f.label + '</b><span class="mut">' + (f.size / 1024).toFixed(1) + ' ko</span></div></div>').join('') || '<p class="mut">Aucun élément.</p>';
 }
 function listDir() { filterPending = true; sendGfdi(5007, new Uint8Array([0]), 'DIRECTORY_FILTER aucun'); }
 let filterPending = false;
@@ -298,7 +355,7 @@ async function importFit(f) {
 }
 
 $('#go').onclick = connect;
-$('#dir').onclick = () => { if (gfdi) listDir(); };
+$('#dir').onclick = () => { if (gfdi) itemList(); };
 $('#stop').onclick = () => { if (dev && dev.gatt.connected) dev.gatt.disconnect(); };
 $('#copy').onclick = () => { navigator.clipboard.writeText(logEl.value).then(() => { $('#copy').textContent = 'Copié'; setTimeout(() => $('#copy').textContent = 'Copier', 1500); }); };
 log('prêt · ' + navigator.userAgent.replace(/^.*?\(/, '(').slice(0, 80));
