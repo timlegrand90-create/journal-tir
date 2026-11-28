@@ -102,7 +102,7 @@ function msg(type, payload) {
 
 /* ---------- BLE state ---------- */
 let dev = null, rx = null, tx = null, txNoResp = false, gfdi = 0, buf = new Uint8Array(0), q = Promise.resolve(), devInfo = null, dl = null, regTimer = null;
-const NAMES = { 5000: 'RESPONSE', 5002: 'DOWNLOAD_REQUEST', 5004: 'FILE_DATA', 5024: 'DEVICE_INFO', 5030: 'SYSTEM_EVENT', 5031: 'SUPPORTED_FILE_TYPES', 5050: 'CONFIGURATION', 5052: 'CURRENT_TIME_REQ', 5101: 'AUTH_NEGOTIATION' };
+const NAMES = { 5007: 'DIRECTORY_FILTER', 5043: 'PROTOBUF', 5054: 'COMPRESSED_DATA', 5000: 'RESPONSE', 5002: 'DOWNLOAD_REQUEST', 5004: 'FILE_DATA', 5024: 'DEVICE_INFO', 5030: 'SYSTEM_EVENT', 5031: 'SUPPORTED_FILE_TYPES', 5050: 'CONFIGURATION', 5052: 'CURRENT_TIME_REQ', 5101: 'AUTH_NEGOTIATION' };
 const nm = t => NAMES[t] || String(t);
 
 function write(bytes, what) {
@@ -190,6 +190,8 @@ function onMsg(m) {
     if (type === 5050) return onConfig(p);
     if (type === 5000) return onResponse(p);
     if (type === 5004) return onFileData(p);
+    if (type === 5043) { const rid = p.u16(), off = p.u32(); sendGfdi(5000, new W().u16(5043).u8(0).u16(rid).u32(off).u8(0).u8(0).get(), 'ACK PROTOBUF'); return; }
+    if (type === 5052) { const ref = p.u32(), now = Math.floor(Date.now() / 1000), tz = -new Date().getTimezoneOffset() * 60; sendGfdi(5000, new W().u16(5052).u8(0).u32(ref).u32(now - GEPOCH).u32(tz).u32(0).u32(0).get(), 'HEURE'); return; }
     if (type === 5101) { const unk = p.u8(), flags = p.u32(); ack(5101, 0, new W().u8(0).u8(unk).u32(flags).get()); return; }
     log('(message ' + type + ' ignoré)');
   } catch (e) { log('! lecture ' + nm(type) + ' : ' + e.message); }
@@ -212,18 +214,21 @@ function onConfig(p) {
   etat('connecté', 'ok');
   setTimeout(listDir, 400);
 }
-function listDir() { startDl({ index: 0, type: 'dir' }); }
+function listDir() { filterPending = true; sendGfdi(5007, new Uint8Array([0]), 'DIRECTORY_FILTER aucun'); }
+let filterPending = false;
 function startDl(entry) {
   if (dl) { log('! téléchargement déjà en cours'); return; }
   dl = { entry, size: 0, got: 0, crc: 0, parts: [] };
-  sendGfdi(5002, new W().u16(entry.index).u32(0).u8(1).u16(0).u32(0).get(), 'DOWNLOAD fichier ' + entry.index);
+  sendGfdi(5002, new W().u16(entry.index).u32(0).u8(1).u16(0).u32(0).u8(0).get(), 'DOWNLOAD fichier ' + entry.index);
   if (entry.type === 'dir') etat('lecture de la liste…', 'cy'); else etat('téléchargement du fichier ' + entry.index + '…', 'cy');
 }
 function onResponse(p) {
   const orig = p.u16(), st = p.u8();
+  if (orig === 5007 && filterPending) { filterPending = false; const fs = p.left ? p.u8() : -1; log('filtre : statut ' + st + ', réponse ' + fs); startDl({ index: 0, type: 'dir' }); return; }
   if (orig === 5002) {
     if (!dl) return;
     const ds = p.left ? p.u8() : -1, size = p.left >= 4 ? p.u32() : 0;
+    if (st === 0 && ds === 3 && (dl.retry = (dl.retry || 0) + 1) < 6) { const e = dl.entry; dl = null; log('pas prêt, nouvel essai'); setTimeout(() => startDl(e), 1000); return; }
     if (st !== 0 || ds !== 0) { log('! téléchargement refusé (statut ' + st + ', ' + ['OK', 'index inconnu', 'illisible', 'plus de place', 'invalide', 'pas prêt', 'CRC'][ds] + ')'); etat('le Xero refuse le téléchargement', 'ko'); dl = null; return; }
     dl.size = size; log('taille annoncée : ' + size + ' octets');
     if (!size) finishDl();
