@@ -296,6 +296,32 @@ function journal(a) {
     + days.map(d => `<div class="day"><h2 style="text-transform:capitalize">${dayFmt(d)}</h2><span class="lab">${esc(ser.find(s => s.date === d).lieu || '')}</span></div>` + ser.filter(s => s.date === d).map(s => serieCard(a, s, true)).join('')).join('');
   bindCards(a, () => journal(a));
 }
+/* Garmin Xero : lecture directe des fichiers .fit (Garmin/Shot_Sessions) — messages FIT 387 (session) et 388 (coup) */
+function parseFit(buf) {
+  const d = new DataView(buf), hs = d.getUint8(0), size = d.getUint32(4, true), end = Math.min(hs + size, buf.byteLength), defs = {}, shots = [];
+  let p = hs, ses = null, t0 = null;
+  const rd = (bt, sz, le, o) => { const b = bt & 31; if (sz === 1) return b === 1 ? d.getInt8(o) : d.getUint8(o); if (sz === 2) return b === 3 || b === 11 ? d.getInt16(o, le) : d.getUint16(o, le); if (sz === 4) return b === 5 ? d.getInt32(o, le) : b === 8 ? d.getFloat32(o, le) : d.getUint32(o, le); return null; };
+  while (p < end) {
+    const h = d.getUint8(p++);
+    if (!(h & 0x80) && (h & 0x40)) {
+      const dev = h & 0x20; p++; const le = d.getUint8(p++) === 0, g = d.getUint16(p, le); p += 2; const n = d.getUint8(p++), fl = [];
+      for (let i = 0; i < n; i++, p += 3) fl.push([d.getUint8(p), d.getUint8(p + 1), d.getUint8(p + 2)]);
+      let dz = 0; if (dev) { const nd = d.getUint8(p++); for (let i = 0; i < nd; i++, p += 3) dz += d.getUint8(p + 1); }
+      defs[h & 15] = { g, le, fl, dz }; continue;
+    }
+    const df = defs[h & 0x80 ? (h >> 5) & 3 : h & 15]; if (!df) break;
+    const r = {}; for (const [num, sz, bt] of df.fl) { r[num] = rd(bt, sz, df.le, p); p += sz; } p += df.dz;
+    if (df.g === 387) ses = r;
+    if (df.g === 388 && r[0] != null && r[0] !== 0xFFFFFFFF) { shots.push({ n: r[1], v: r[0] / 1000 }); if (t0 == null && r[253] != null) t0 = r[253]; }
+  }
+  if (!shots.length) return null;
+  shots.sort((a, b) => a.n - b.n);
+  const ts = (t0 ?? (ses && ses[253])), dt = ts != null ? new Date((ts + 631065600) * 1000) : null;
+  const pad = x => String(x).padStart(2, '0');
+  return { shots: shots.map(s => Math.round(s.v * 10) / 10), grains: ses && ses[5] != null && ses[5] !== 0xFFFF ? ses[5] / 10 : null,
+    date: dt ? `${dt.getFullYear()}-${pad(dt.getMonth() + 1)}-${pad(dt.getDate())}` : null, heure: dt ? `${pad(dt.getHours())}:${pad(dt.getMinutes())}` : null };
+}
+function parseCsv(t) { const shots = []; for (const line of t.split(/\r?\n/)) { const m = line.match(/^\s*\d+\s*[,;]\s*"?(\d{2,4}(?:[.,]\d+)?)"?/); if (m) shots.push(parseFloat(m[1].replace(',', '.'))); } return shots.length ? { shots, grains: null, date: null, heure: null } : null; }
 /* ---------- anémomètre Calypso (Bluetooth, protocole public) ---------- */
 let calDev = null;
 function calypso(use) {
@@ -368,7 +394,8 @@ function serie(a) {
   <div class="grid g2" style="margin-top:10px"><div class="kpi"><div class="lab">Coups</div><div class="step"><button type="button" id="cm" aria-label="Un coup de moins">−</button><span class="num amb">${esc(f.coups)}</span><button type="button" id="cpl" aria-label="Un coup de plus">+</button></div></div>
     <div class="grid"><div><label for="fdi">Distance de ces ${esc(f.coups)} coups (m)</label><input id="fdi" inputmode="numeric" value="${esc(f.dist)}"></div><div><label for="ft">Température (°C)</label><input id="ft" inputmode="decimal" value="${esc(f.temp)}"></div></div></div>
   <div class="sec">Vitesses</div>
-  <label class="drop" for="csv">${ICON.u}<span><b>Importer le fichier du chrono</b><br><span class="lab">Garmin Xero, LabRadar… (.csv)</span></span><input id="csv" type="file" accept=".csv,.txt,text/csv"></label>
+  <label class="drop" for="csv">${ICON.u}<span><b>Importer le chrono</b><br><span class="lab">Garmin Xero branché en USB (dossier Garmin › Shot_Sessions, .fit) ou export CSV</span></span><input id="csv" type="file" accept=".fit,.FIT,.csv,.txt,text/csv,application/octet-stream" multiple></label>
+  ${st.fitList ? `<div class="card" style="margin-top:10px;border-color:var(--cy)"><b>Choisis la séance</b>${st.fitList.map((x, i) => `<button type="button" class="chip" data-fit="${i}" style="width:100%;margin-top:8px;display:flex;justify-content:space-between"><span>${x.date ? new Date(x.date + 'T12:00').toLocaleDateString('fr-FR') : ''} ${esc(x.heure || '')}${x.grains ? ' · ' + fr(x.grains) + ' gr' : ''}</span><span class="cy">${x.shots.length} coups · ${fr(mean(x.shots))} m/s</span></button>`).join('')}</div>` : ''}
   ${sv ? `<p class="note gr">${sv}</p>` : `<div class="grid g3" style="margin-top:10px"><div><label for="fv">V moy</label><input id="fv" inputmode="decimal" value="${esc(f.v)}"></div><div><label for="fsd">SD</label><input id="fsd" inputmode="decimal" value="${esc(f.sd)}"></div><div><label for="fes">ES</label><input id="fes" inputmode="decimal" value="${esc(f.es)}"></div></div>`}
   <div class="sec">Résultat</div>
   <div class="grid g3"><div><label for="fg">Groupe (mm)</label><input id="fg" inputmode="decimal" value="${esc(f.groupe)}"></div><div><label for="fh">Hausse (clics)</label><input id="fh" inputmode="numeric" value="${esc(f.hausse)}"></div><div><label for="fde">Dérive (clics)</label><input id="fde" inputmode="numeric" value="${esc(f.derive)}"></div></div>
@@ -381,7 +408,14 @@ function serie(a) {
   const cok = $('#cok'); if (cok) cok.onclick = () => { keep(); const id = readCharge(a); if (!id) return; f.charge = id; st.addCharge = false; save('Charge ajoutée'); serie(a); };
   $('#cm').onclick = () => { keep(); f.coups = Math.max(1, f.coups - 1); serie(a); };
   $('#cpl').onclick = () => { keep(); f.coups++; serie(a); };
-  $('#csv').onchange = e => { const file = e.target.files[0]; if (!file) return; file.text().then(t => { keep(); const shots = []; for (const line of t.split(/\r?\n/)) { const m = line.match(/^\s*\d+\s*[,;]\s*"?(\d{3,4}(?:[.,]\d+)?)"?/); if (m) shots.push(parseFloat(m[1].replace(',', '.'))); } if (!shots.length) { toast('Aucune vitesse trouvée'); return; } f.shots = shots; f.coups = shots.length; f.v = fr(mean(shots)); f.sd = +sdev(shots).toFixed(1); f.es = +(Math.max(...shots) - Math.min(...shots)).toFixed(1); serie(a); }); };
+  const useSes = x => { const shots = x.shots; f.shots = shots; f.coups = shots.length; f.v = fr(mean(shots)); f.sd = +sdev(shots).toFixed(1); f.es = +(Math.max(...shots) - Math.min(...shots)).toFixed(1); if (x.date) f.date = x.date; if (x.heure) f.heure = x.heure;
+    if (x.grains) { const c = a.charges.find(k => k.id === f.charge); if (c && Math.abs((c.grains || 0) - x.grains) > 1) { const m = a.charges.filter(k => Math.abs((k.grains || 0) - x.grains) <= 1); if (m.length === 1) f.charge = m[0].id; else toast('Le chrono était réglé sur ' + fr(x.grains) + ' gr : vérifie la charge'); } }
+    st.fitList = null; serie(a); };
+  app.querySelectorAll('[data-fit]').forEach(b => b.onclick = () => { keep(); useSes(st.fitList[+b.dataset.fit]); });
+  $('#csv').onchange = e => { const files = [...e.target.files]; if (!files.length) return; keep();
+    Promise.all(files.map(fl => /\.fit$/i.test(fl.name) ? fl.arrayBuffer().then(b => { try { return parseFit(b); } catch (x) { return null; } }) : fl.text().then(parseCsv))).then(list => { list = list.filter(Boolean).sort((p, q) => ((q.date || '') + (q.heure || '')).localeCompare((p.date || '') + (p.heure || '')));
+      if (!list.length) { toast('Aucune vitesse trouvée dans ce fichier'); return; }
+      if (list.length === 1) useSes(list[0]); else { st.fitList = list; serie(a); } }); };
   $('#fs').onsubmit = e => { e.preventDefault(); keep(); if (!f.charge) { toast('Ajoute une charge'); return; } const s = { id: f.id || uid(), date: f.date, heure: f.heure, lieu: f.lieu, charge: f.charge, coups: f.coups, dist: num(f.dist), temp: num(f.temp), v: f.shots.length ? '' : num(f.v), sd: num(f.sd), es: num(f.es), groupe: num(f.groupe), hausse: num(f.hausse), derive: num(f.derive), nettoye: f.nettoye, notes: f.notes, shots: f.shots };
     const i = a.series.findIndex(x => x.id === s.id); if (i >= 0) a.series[i] = s; else a.series.push(s); st.form = null; save('Série enregistrée'); location.hash = 'a-' + a.id + '-c-' + s.charge; };
 }
