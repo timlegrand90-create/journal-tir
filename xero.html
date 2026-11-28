@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Test Xero – Journal de tir</title>
+<meta name="theme-color" content="#14181F">
+<style>
+:root{color-scheme:dark;--bg:#1C2129;--card:#252B36;--line:#323A48;--deep:#14181F;--ink:#E6EAF0;--mut:#9AA5B5;--amb:#FFB826;--cy:#4CC0F2;--gr:#40E08C;--red:#F25959}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.5 system-ui,sans-serif}
+main{max-width:560px;margin:0 auto;padding:20px 16px 60px}
+h1{font-size:28px;margin:0 0 4px}
+p{margin:6px 0}
+.mut{color:var(--mut);font-size:14px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:14px;margin:12px 0}
+button{font:inherit;color:#111;background:var(--amb);border:0;border-radius:12px;padding:12px 16px;font-weight:600;cursor:pointer}
+button.sec{background:var(--deep);color:var(--ink);border:1px solid var(--line)}
+button:disabled{opacity:.4}
+.btns{display:flex;flex-wrap:wrap;gap:8px}
+#etat{font-weight:600}
+.ok{color:var(--gr)}.ko{color:var(--red)}.cy{color:var(--cy)}
+#log{width:100%;height:260px;background:var(--deep);color:var(--mut);border:1px solid var(--line);border-radius:12px;padding:10px;font:12px/1.4 ui-monospace,monospace;white-space:pre}
+.f{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:10px 0;border-top:1px solid var(--line)}
+.f:first-child{border-top:0}
+.f b{display:block}
+a{color:var(--cy)}
+</style>
+</head>
+<body>
+<main>
+<a href="./">← Journal</a>
+<h1>Test Bluetooth Xero</h1>
+<p class="mut">Expérimental. Lecture seule : rien n'est effacé ni modifié sur le Xero.<br>Avant : ferme ShotView (arrêt forcé), Xero allumé à côté du téléphone.</p>
+
+<div class="card">
+  <p>État : <span id="etat">non connecté</span></p>
+  <p id="info" class="mut"></p>
+  <div class="btns">
+    <button id="go">Connecter le Xero</button>
+    <button id="dir" class="sec" disabled>Relire la liste</button>
+    <button id="stop" class="sec" disabled>Déconnecter</button>
+  </div>
+</div>
+
+<div class="card" id="filesCard" hidden>
+  <p><b>Fichiers sur le Xero</b></p>
+  <div id="files"></div>
+</div>
+
+<div class="card">
+  <div class="btns" style="justify-content:space-between;align-items:center">
+    <b>Journal technique</b>
+    <button id="copy" class="sec">Copier</button>
+  </div>
+  <p class="mut">En cas de souci, fais une capture de cette zone (ou copie-la) et envoie-la.</p>
+  <textarea id="log" readonly></textarea>
+</div>
+</main>
+<script>
+'use strict';
+/* Garmin "multi-link" GFDI protocol over BLE, as documented by the Gadgetbridge project (AGPL-3.0).
+   Read-only: device info handshake, directory listing (file 0) and file download. */
+const UUID = n => '6a4e' + n.toString(16).padStart(4, '0') + '-667b-11e3-949a-0800200c9a66';
+const SVC = UUID(0x2800), CLIENT_ID = 2n, GEPOCH = 631065600;
+const $ = s => document.querySelector(s);
+const logEl = $('#log'), t0 = Date.now();
+const hex = (u, max = 48) => Array.from(u.slice(0, max), b => b.toString(16).padStart(2, '0')).join(' ') + (u.length > max ? ' …(' + u.length + ')' : '');
+function log(s) { logEl.value += ((Date.now() - t0) / 1000).toFixed(2).padStart(7) + '  ' + s + '\n'; logEl.scrollTop = logEl.scrollHeight; }
+function etat(s, c) { const e = $('#etat'); e.textContent = s; e.className = c || ''; }
+
+/* ---------- CRC (Garmin / FIT nibble table) ---------- */
+const CT = [0x0000, 0xCC01, 0xD801, 0x1400, 0xF001, 0x3C00, 0x2800, 0xE401, 0xA001, 0x6C00, 0x7800, 0xB401, 0x5000, 0x9C01, 0x8801, 0x4400];
+function crc16(d, seed = 0) { let c = seed; for (const b of d) { c = (((c >> 4) & 4095) ^ CT[c & 15]) ^ CT[b & 15]; c = (((c >> 4) & 4095) ^ CT[c & 15]) ^ CT[(b >> 4) & 15]; } return c; }
+
+/* ---------- COBS with Garmin leading/trailing zero ---------- */
+function cobsEnc(d) {
+  const o = [0]; let i = 0;
+  for (;;) {
+    const s = i; while (i < d.length && d[i] !== 0 && i - s < 254) i++;
+    const n = i - s; o.push(n + 1); for (let k = s; k < i; k++) o.push(d[k]);
+    if (i >= d.length) break;
+    if (n === 254) continue;
+    i++; if (i === d.length) { o.push(1); break; }
+  }
+  o.push(0); return new Uint8Array(o);
+}
+function cobsDec(f) {
+  const o = []; let i = 0;
+  while (i < f.length) { const c = f[i++]; for (let k = 1; k < c && i < f.length; k++) o.push(f[i++]); if (c !== 0xFF && i < f.length) o.push(0); }
+  return new Uint8Array(o);
+}
+
+/* ---------- little-endian helpers ---------- */
+class W { constructor() { this.a = []; } u8(v) { this.a.push(v & 255); return this; } u16(v) { return this.u8(v).u8(v >> 8); } u32(v) { return this.u16(v & 0xFFFF).u16(v >>> 16); } u64(v) { for (let k = 0n; k < 8n; k++) this.u8(Number((v >> (8n * k)) & 255n)); return this; } str(s) { const b = new TextEncoder().encode(s); this.u8(b.length); b.forEach(x => this.u8(x)); return this; } bytes(b) { b.forEach(x => this.u8(x)); return this; } get() { return new Uint8Array(this.a); } }
+class R { constructor(u) { this.u = u; this.d = new DataView(u.buffer, u.byteOffset, u.byteLength); this.p = 0; } get left() { return this.u.length - this.p; } u8() { return this.u[this.p++]; } u16() { const v = this.d.getUint16(this.p, true); this.p += 2; return v; } u32() { const v = this.d.getUint32(this.p, true); this.p += 4; return v; } u64() { const v = this.d.getBigUint64(this.p, true); this.p += 8; return v; } str() { const n = this.u8(), s = new TextDecoder().decode(this.u.slice(this.p, this.p + n)); this.p += n; return s; } rest() { const b = this.u.slice(this.p); this.p = this.u.length; return b; } }
+
+function msg(type, payload) {
+  const len = 4 + payload.length + 2, b = new W().u16(len).u16(type).bytes(payload).get();
+  const c = crc16(b); return new W().bytes(b).u16(c).get();
+}
+
+/* ---------- BLE state ---------- */
+let dev = null, rx = null, tx = null, txNoResp = false, gfdi = 0, buf = new Uint8Array(0), q = Promise.resolve(), devInfo = null, dl = null, regTimer = null;
+const NAMES = { 5000: 'RESPONSE', 5002: 'DOWNLOAD_REQUEST', 5004: 'FILE_DATA', 5024: 'DEVICE_INFO', 5030: 'SYSTEM_EVENT', 5031: 'SUPPORTED_FILE_TYPES', 5050: 'CONFIGURATION', 5052: 'CURRENT_TIME_REQ', 5101: 'AUTH_NEGOTIATION' };
+const nm = t => NAMES[t] || String(t);
+
+function write(bytes, what) {
+  q = q.then(async () => {
+    if (!tx) return;
+    try { if (txNoResp && tx.writeValueWithoutResponse) await tx.writeValueWithoutResponse(bytes); else await tx.writeValueWithResponse(bytes); }
+    catch (e) { log('! écriture ' + (what || '') + ' : ' + e.message); }
+  });
+  return q;
+}
+function sendGfdi(type, payload, label) {
+  const m = msg(type, payload), enc = cobsEnc(m);
+  log('→ ' + (label || nm(type)) + '  ' + hex(m, 32));
+  for (let i = 0; i < enc.length; i += 19) write(new Uint8Array([gfdi, ...enc.slice(i, i + 19)]), label);
+}
+const ack = (orig, status = 0, extra = []) => sendGfdi(5000, new W().u16(orig).u8(status).bytes(extra).get(), 'ACK ' + nm(orig));
+
+async function connect() {
+  if (!navigator.bluetooth) { etat('Bluetooth web indisponible : ouvre cette page dans Chrome Android', 'ko'); return; }
+  try {
+    etat('choix de l’appareil…');
+    dev = await navigator.bluetooth.requestDevice({ filters: [{ namePrefix: 'Xero' }, { services: [SVC] }], optionalServices: [SVC] });
+    log('appareil : ' + dev.name);
+    dev.addEventListener('gattserverdisconnected', () => { log('déconnecté'); etat('déconnecté', 'ko'); setBtns(false); rx = tx = null; gfdi = 0; });
+    etat('connexion…');
+    const g = await dev.gatt.connect(); log('GATT connecté');
+    const s = await g.getPrimaryService(SVC); log('service Garmin trouvé');
+    const chars = await s.getCharacteristics();
+    log('caractéristiques : ' + chars.map(c => c.uuid.slice(4, 8) + '[' + ['read', 'write', 'writeWithoutResponse', 'notify', 'indicate'].filter(p => c.properties[p]).join(',') + ']').join(' '));
+    for (let i = 0x2810; i <= 0x2814 && !tx; i++) {
+      const r = chars.find(c => c.uuid === UUID(i)), w = chars.find(c => c.uuid === UUID(i + 0x10));
+      if (r && w) { rx = r; tx = w; }
+    }
+    if (!tx) { etat('canal Garmin absent', 'ko'); log('! aucune paire 281x/282x'); return; }
+    txNoResp = !!tx.properties.writeWithoutResponse;
+    rx.addEventListener('characteristicvaluechanged', e => onData(new Uint8Array(e.target.value.buffer.slice(e.target.value.byteOffset, e.target.value.byteOffset + e.target.value.byteLength))));
+    await rx.startNotifications(); log('notifications actives sur ' + rx.uuid.slice(4, 8) + ', écriture sur ' + tx.uuid.slice(4, 8) + (txNoResp ? ' (sans réponse)' : ''));
+    setBtns(true);
+    etat('négociation…', 'cy');
+    write(new W().u8(0).u8(5).u64(CLIENT_ID).u16(0).get(), 'CLOSE_ALL');
+    log('→ handle 0 : fermer les canaux');
+    regTimer = setTimeout(() => { if (!gfdi) { log('! pas de réponse au CLOSE_ALL, tentative d’ouverture directe'); register(); } }, 3000);
+  } catch (e) { log('! ' + e.name + ' : ' + e.message); etat(e.name === 'NotFoundError' ? 'annulé' : 'échec : ' + e.message, 'ko'); }
+}
+function register() { write(new W().u8(0).u8(0).u64(CLIENT_ID).u16(1).u8(0).get(), 'REGISTER'); log('→ handle 0 : ouvrir le canal GFDI'); }
+function setBtns(on) { $('#go').disabled = on; $('#stop').disabled = !on; $('#dir').disabled = !on; }
+
+function onData(u) {
+  const h = u[0];
+  if (h === 0) return onMgmt(new R(u.slice(1)));
+  if (h !== gfdi || !gfdi) { log('← handle ' + h + ' : ' + hex(u)); return; }
+  const n = new Uint8Array(buf.length + u.length - 1); n.set(buf); n.set(u.slice(1), buf.length); buf = n;
+  for (;;) {
+    let s = buf.indexOf(0); if (s < 0) { buf = new Uint8Array(0); return; }
+    if (s > 0) buf = buf.slice(s);
+    const e = buf.indexOf(0, 1); if (e < 0) return;
+    const frame = buf.slice(1, e); buf = buf.slice(e + 1);
+    if (frame.length) onMsg(cobsDec(frame));
+  }
+}
+function onMgmt(r) {
+  const type = r.u8(), cid = r.left >= 8 ? r.u64() : -1n;
+  log('← handle 0 : type ' + type + ' client ' + cid + ' ' + hex(r.u.slice(r.p)));
+  if (cid !== CLIENT_ID) return;
+  if (type === 6) { clearTimeout(regTimer); register(); }
+  else if (type === 1) {
+    const svc = r.u16(), st = r.u8(), hd = r.left ? r.u8() : 0;
+    if (svc === 1 && st === 0) { gfdi = hd; log('canal GFDI ouvert, handle ' + hd); etat('canal ouvert, attente du Xero…', 'cy'); setTimeout(() => { if (!devInfo) log('! le Xero n’a pas envoyé ses infos'); }, 6000); }
+    else { log('! ouverture refusée (service ' + svc + ', statut ' + st + ')'); etat('le Xero refuse le canal', 'ko'); }
+  }
+}
+
+function onMsg(m) {
+  if (m.length < 6) { log('! message trop court ' + hex(m)); return; }
+  const r = new R(m), len = r.u16();
+  if (len !== m.length) { log('! longueur ' + len + ' ≠ ' + m.length + ' : ' + hex(m)); return; }
+  const crc = new DataView(m.buffer, m.byteOffset).getUint16(len - 2, true);
+  if (crc16(m.slice(0, len - 2)) !== crc) { log('! CRC faux : ' + hex(m)); return; }
+  let type = r.u16();
+  if (type & 0x8000) { const seq = (type >> 8) & 0x7F; type = (type & 0xFF) + 5000; log('(identifiant compact, séquence ' + seq + ')'); }
+  const p = new R(m.slice(4, len - 2));
+  if (type !== 5004) log('← ' + nm(type) + '  ' + hex(m.slice(4, len - 2)));
+  try {
+    if (type === 5024) return onDevInfo(p);
+    if (type === 5050) return onConfig(p);
+    if (type === 5000) return onResponse(p);
+    if (type === 5004) return onFileData(p);
+    if (type === 5101) { const unk = p.u8(), flags = p.u32(); ack(5101, 0, new W().u8(0).u8(unk).u32(flags).get()); return; }
+    log('(message ' + type + ' ignoré)');
+  } catch (e) { log('! lecture ' + nm(type) + ' : ' + e.message); }
+}
+
+function onDevInfo(p) {
+  const proto = p.u16(), product = p.u16(), unit = p.u32(), sw = p.u16(), maxPkt = p.u16(), bt = p.str(), name = p.str(), model = p.str();
+  devInfo = { proto, product, unit, sw, maxPkt, bt, name, model };
+  $('#info').textContent = (name || bt) + ' · modèle ' + model + ' · produit ' + product + ' · logiciel ' + (sw / 100).toFixed(2) + ' · protocole ' + proto;
+  log('infos : ' + JSON.stringify(devInfo));
+  ack(5024);
+  sendGfdi(5000, new W().u16(5024).u8(0).u16(150).u16(0xFFFF).u32(0xFFFFFFFF).u16(7791).u16(0xFFFF).str('Journal de tir').str('Android').str('phone').u8(Math.floor(proto / 100) === 1 ? 1 : 0).get(), 'réponse DEVICE_INFO');
+  etat('le Xero a répondu, échange en cours…', 'cy');
+}
+function onConfig(p) {
+  const n = p.u8(), caps = p.u.slice(p.p, p.p + n);
+  ack(5050);
+  sendGfdi(5050, new W().u8(caps.length).bytes(caps).get(), 'CONFIGURATION (copie)');
+  sendGfdi(5030, new W().u8(8).u8(0).get(), 'SYSTEM_EVENT sync_ready');
+  etat('connecté', 'ok');
+  setTimeout(listDir, 400);
+}
+function listDir() { startDl({ index: 0, type: 'dir' }); }
+function startDl(entry) {
+  if (dl) { log('! téléchargement déjà en cours'); return; }
+  dl = { entry, size: 0, got: 0, crc: 0, parts: [] };
+  sendGfdi(5002, new W().u16(entry.index).u32(0).u8(1).u16(0).u32(0).get(), 'DOWNLOAD fichier ' + entry.index);
+  if (entry.type === 'dir') etat('lecture de la liste…', 'cy'); else etat('téléchargement du fichier ' + entry.index + '…', 'cy');
+}
+function onResponse(p) {
+  const orig = p.u16(), st = p.u8();
+  if (orig === 5002) {
+    if (!dl) return;
+    const ds = p.left ? p.u8() : -1, size = p.left >= 4 ? p.u32() : 0;
+    if (st !== 0 || ds !== 0) { log('! téléchargement refusé (statut ' + st + ', ' + ['OK', 'index inconnu', 'illisible', 'plus de place', 'invalide', 'pas prêt', 'CRC'][ds] + ')'); etat('le Xero refuse le téléchargement', 'ko'); dl = null; return; }
+    dl.size = size; log('taille annoncée : ' + size + ' octets');
+    if (!size) finishDl();
+  } else log('statut ' + nm(orig) + ' = ' + ['ACK', 'NAK', 'non supporté', 'erreur décodage', 'erreur CRC', 'erreur longueur'][st]);
+}
+function onFileData(p) {
+  const flags = p.u8(), crc = p.u16(), off = p.u32(), data = p.rest();
+  if (!dl) { log('! données sans téléchargement'); return; }
+  if (off !== dl.got) { log('! décalage ' + off + ' attendu ' + dl.got); sendGfdi(5000, new W().u16(5004).u8(0).u8(4).u32(dl.got).get(), 'ACK FILE_DATA (décalage)'); return; }
+  const c = crc16(data, dl.crc);
+  if (c !== crc) { log('! CRC bloc faux à ' + off); sendGfdi(5000, new W().u16(5004).u8(0).u8(3).u32(off).get(), 'ACK FILE_DATA (CRC)'); return; }
+  dl.crc = c; dl.parts.push(data); dl.got += data.length;
+  const m = msg(5000, new W().u16(5004).u8(0).u8(0).u32(off).get()), enc = cobsEnc(m);
+  for (let i = 0; i < enc.length; i += 19) write(new Uint8Array([gfdi, ...enc.slice(i, i + 19)]));
+  if (dl.entry.type !== 'dir') etat('téléchargement ' + Math.round(100 * dl.got / dl.size) + ' %', 'cy');
+  if (dl.got >= dl.size) finishDl();
+}
+function finishDl() {
+  const all = new Uint8Array(dl.got); let o = 0; for (const x of dl.parts) { all.set(x, o); o += x.length; }
+  const e = dl.entry; dl = null;
+  log('reçu ' + all.length + ' octets (fichier ' + e.index + ')');
+  if (e.type === 'dir') return showDir(all);
+  const isFit = all.length > 12 && String.fromCharCode(...all.slice(8, 12)) === '.FIT';
+  log(isFit ? 'fichier FIT valide' : '! pas un fichier FIT : ' + hex(all, 16));
+  e.data = all; e.isFit = isFit; etat('fichier ' + e.index + ' reçu', 'ok'); renderFiles();
+}
+const TYPES = { '128/4': 'Activité', '128/2': 'Réglages', '128/1': 'Appareil', '128/32': 'Suivi', '128/41': 'Journal', '128/44': 'Mesures' };
+let files = [];
+function showDir(u) {
+  files = []; const r = new R(u);
+  while (r.left >= 16) {
+    const index = r.u16(), dt = r.u8(), sub = r.u8(), num = r.u16(), sf = r.u8(), ff = r.u8(), size = r.u32(), ts = r.u32();
+    files.push({ index, dt, sub, num, sf, ff, size, date: ts ? new Date((ts + GEPOCH) * 1000) : null });
+  }
+  log(files.length + ' fichiers : ' + files.map(f => f.index + ':' + f.dt + '/' + f.sub + ':' + f.size).join(' '));
+  etat(files.length + ' fichiers trouvés', 'ok'); renderFiles();
+}
+function renderFiles() {
+  $('#filesCard').hidden = false;
+  const box = $('#files'); box.innerHTML = '';
+  if (!files.length) { box.innerHTML = '<p class="mut">Aucun fichier.</p>'; return; }
+  [...files].sort((a, b) => (b.date || 0) - (a.date || 0)).forEach(f => {
+    const d = document.createElement('div'); d.className = 'f';
+    const lab = TYPES[f.dt + '/' + f.sub] || 'Type ' + f.dt + '/' + f.sub;
+    d.innerHTML = '<div><b>' + lab + ' n°' + f.index + '</b><span class="mut">' + (f.date ? f.date.toLocaleString('fr-FR') : 'sans date') + ' · ' + (f.size / 1024).toFixed(1) + ' ko</span></div>';
+    const bs = document.createElement('div'); bs.className = 'btns';
+    if (!f.data) { const b = document.createElement('button'); b.className = 'sec'; b.textContent = 'Lire'; b.onclick = () => startDl(f); bs.append(b); }
+    else {
+      if (f.isFit) { const b = document.createElement('button'); b.textContent = 'Importer'; b.onclick = () => importFit(f); bs.append(b); }
+      const s = document.createElement('button'); s.className = 'sec'; s.textContent = 'Enregistrer'; s.onclick = () => saveFile(f); bs.append(s);
+    }
+    d.append(bs); box.append(d);
+  });
+}
+function fname(f) { const d = f.date || new Date(); return 'xero-' + d.toISOString().slice(0, 19).replace(/[:T]/g, '-') + '-' + f.index + (f.isFit ? '.fit' : '.bin'); }
+function saveFile(f) { const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([f.data])); a.download = fname(f); a.click(); }
+async function importFit(f) {
+  const c = await caches.open('partage'); for (const k of await c.keys()) await c.delete(k);
+  await c.put('./partage/0/' + encodeURIComponent(fname(f)), new Response(f.data));
+  if (dev && dev.gatt.connected) dev.gatt.disconnect();
+  location.href = './#partage';
+}
+
+$('#go').onclick = connect;
+$('#dir').onclick = () => { if (gfdi) listDir(); };
+$('#stop').onclick = () => { if (dev && dev.gatt.connected) dev.gatt.disconnect(); };
+$('#copy').onclick = () => { navigator.clipboard.writeText(logEl.value).then(() => { $('#copy').textContent = 'Copié'; setTimeout(() => $('#copy').textContent = 'Copier', 1500); }); };
+log('prêt · ' + navigator.userAgent.replace(/^.*?\(/, '(').slice(0, 80));
+</script>
+</body>
+</html>
