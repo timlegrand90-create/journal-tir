@@ -296,6 +296,28 @@ function journal(a) {
     + days.map(d => `<div class="day"><h2 style="text-transform:capitalize">${dayFmt(d)}</h2><span class="lab">${esc(ser.find(s => s.date === d).lieu || '')}</span></div>` + ser.filter(s => s.date === d).map(s => serieCard(a, s, true)).join('')).join('');
   bindCards(a, () => journal(a));
 }
+/* ---------- anémomètre Calypso (Bluetooth, protocole public) ---------- */
+let calDev = null;
+function calypso(use) {
+  const box = $('#calbox');
+  if (!navigator.bluetooth) { box.innerHTML = '<p class="note red">Bluetooth indisponible dans ce navigateur. Utilise Chrome sur Android, appli ouverte depuis son adresse https.</p>'; return; }
+  const S = []; let alive = true, ch = [];
+  box.innerHTML = `<div class="card" style="margin-top:10px;border-color:var(--cy)"><p style="margin:0 0 10px">Pointe le <b>repère avant</b> de l'anémomètre vers la cible, à hauteur de tir.</p>
+    <div class="grid g3"><div class="kpi"><div class="num cy" style="font-size:30px" id="cu">…</div><div class="lab">m/s (moy. 10 s)</div></div><div class="kpi"><div class="num cy" style="font-size:30px" id="ch">…</div><div class="lab">vient de (h)</div></div><div class="kpi"><div class="num" style="font-size:22px" id="cg">—</div><div class="lab">min / rafale</div></div></div>
+    <p class="note" id="cs" style="margin:8px 0 0">Connexion…</p>
+    <div class="grid g2" style="margin-top:10px"><button class="btn b-out" id="cx">Fermer</button><button class="btn b-amb" id="cok" disabled>Utiliser ce vent</button></div></div>`;
+  const stop = () => { alive = false; ch.forEach(c => { try { c.stopNotifications(); } catch (e) {} }); try { calDev && calDev.gatt.connected && calDev.gatt.disconnect(); } catch (e) {} };
+  $('#cx').onclick = () => { stop(); box.innerHTML = ''; };
+  const avg = () => { const now = Date.now(); while (S.length && now - S[0].t > 10000) S.shift(); if (!S.length) return null; let x = 0, y = 0; S.forEach(p => { x += p.u * Math.sin(p.d * Math.PI / 180); y += p.u * Math.cos(p.d * Math.PI / 180); }); x /= S.length; y /= S.length; const d = (Math.atan2(x, y) * 180 / Math.PI + 360) % 360, us = S.map(p => p.u); return { u: mean(us), d, h: (d / 30) || 12, lo: Math.min(...us), hi: Math.max(...us) }; };
+  const push = (u, d) => { if (!alive || !(u >= 0)) return; S.push({ t: Date.now(), u, d }); const A = avg(); if (!A || !$('#cu')) return; $('#cu').textContent = fr(A.u); $('#ch').textContent = fr(A.h < .5 ? 12 : A.h, 1); $('#cg').textContent = fr(A.lo) + ' / ' + fr(A.hi); $('#cs').textContent = S.length + ' mesures sur les 10 dernières secondes · direction ' + Math.round(A.d) + '° par rapport à la cible'; $('#cok').disabled = false; };
+  $('#cok').onclick = () => { const A = avg(); if (!A) return; stop(); box.innerHTML = ''; use({ u: A.u, h: A.h < .5 ? 12 : A.h }); };
+  const pick = calDev && calDev.gatt ? Promise.resolve(calDev) : navigator.bluetooth.requestDevice({ filters: [{ namePrefix: 'ULTRASONIC' }, { namePrefix: 'Ultrasonic' }, { namePrefix: 'CMI' }], optionalServices: [0x180d, 0x181a, 0x180f] });
+  pick.then(dev => { calDev = dev; $('#cs').textContent = 'Connexion à ' + (dev.name || 'Calypso') + '…'; return dev.gatt.connect(); })
+    .then(srv => srv.getPrimaryService(0x180d).then(sv => sv.getCharacteristic(0x2a39)).then(c => { ch.push(c); c.addEventListener('characteristicvaluechanged', e => { const v = e.target.value; push(v.getUint16(0, true) / 100, v.getUint16(2, true)); }); return c.startNotifications(); })
+      .catch(() => srv.getPrimaryService(0x181a).then(sv => Promise.all([sv.getCharacteristic(0x2a72), sv.getCharacteristic(0x2a73)])).then(([cu, cd]) => { let d = 0; ch.push(cu, cd); cd.addEventListener('characteristicvaluechanged', e => { d = e.target.value.getUint16(0, true) / 100; }); cu.addEventListener('characteristicvaluechanged', e => push(e.target.value.getUint16(0, true) / 100, d)); return cd.startNotifications().then(() => cu.startNotifications()); })))
+    .then(() => { if ($('#cs')) $('#cs').textContent = 'Connecté, en attente des mesures…'; })
+    .catch(e => { if ($('#cs')) $('#cs').textContent = e && e.name === 'NotFoundError' ? 'Aucun anémomètre choisi.' : 'Connexion impossible : allume le Calypso et réessaie.'; });
+}
 /* ---------- calcul en pop-up ---------- */
 let modalEl = null;
 function closeModal(silent) { if (modalEl) { modalEl.remove(); modalEl = null; document.body.style.overflow = ''; } }
@@ -381,10 +403,11 @@ function calcul(a, c) {
     <div><div class="num ${TR.n ? 'gr' : ''}" style="font-size:24px">${TR.n ? (TR.dv > 0 ? '+' : '') + TR.dv + ' m/s' : '—'}</div><div class="lab">${TR.n ? 'recalage sur ' + TR.n + ' vérif.' : 'pas encore recalé'}</div></div></div>
     <p class="note" style="margin:8px 0 0">Vref ${fr(K.vref)} m/s à ${fr(K.tref, 0)} °C${K.sens ? ' · ' + (K.sens > 0 ? '+' : '') + fr(K.sens, 2) + ' m/s par °C (mesuré)' : ' · sensibilité T° pas encore mesurable'}${TR.n && TR.bm !== 1 ? ' · BC ×' + fr(TR.bm, 3) + ' (tirs ≥ 600 m)' : ''}${TR.n && TR.dm !== 1 ? ' · dérive ×' + fr(TR.dm, 2) : ''}</p>${Math.abs(TR.dv) > 25 ? '<p class="note amb" style="margin:6px 0 0">⚠ Gros recalage (' + (TR.dv > 0 ? '+' : '') + TR.dv + ' m/s) : vérifie aussi ton zéro et la valeur réelle d\'un clic de ta lunette.</p>' : ''}</div>
   <div class="grid g4"><div><label for="rt">T° (°C)</label><input id="rt" inputmode="decimal" value="${C.T}"></div><div><label for="rp">hPa</label><input id="rp" inputmode="numeric" value="${C.P}"></div><div><label for="ru">Humidité %</label><input id="ru" inputmode="numeric" value="${C.hum}"></div><div><label for="ra">Angle (°)</label><input id="ra" inputmode="decimal" value="${C.ang}"></div></div>
-  <div class="grid g4" style="margin-top:8px"><div><label for="rw">Vent m/s</label><input id="rw" inputmode="decimal" value="${C.W}"></div><div><label for="rh">Vient de (h)</label><select id="rh">${[...Array(12)].map((_, i) => `<option ${C.H === i + 1 ? 'selected' : ''}>${i + 1}</option>`).join('')}</select></div><div><label for="rz">Direction (°)</label><input id="rz" inputmode="numeric" value="${C.az ?? ''}" placeholder="facult."></div><div><label for="rl">Latitude</label><input id="rl" inputmode="decimal" value="${C.lat}"></div></div>
-  <button class="btn b-amb" id="aim" style="width:100%;margin-top:10px;min-height:56px;font-size:18px">🎯 Pointer la cible</button>
+  <div class="grid g4" style="margin-top:8px"><div><label for="rw">Vent m/s</label><input id="rw" inputmode="decimal" value="${C.W}"></div><div><label for="rh">Vient de (h)</label><input id="rh" inputmode="decimal" value="${fr(C.H, C.H % 1 ? 1 : 0)}"></div><div><label for="rz">Direction (°)</label><input id="rz" inputmode="numeric" value="${C.az ?? ''}" placeholder="facult."></div><div><label for="rl">Latitude</label><input id="rl" inputmode="decimal" value="${C.lat}"></div></div>
+  <div class="grid g2" style="margin-top:10px"><button class="btn b-amb" id="aim" style="min-height:56px;font-size:17px">🎯 Pointer la cible</button><button class="btn b-out" id="cal" style="min-height:56px;font-size:17px;border-color:var(--cy);color:var(--cy)">💨 Calypso</button></div>
+  <div id="calbox"></div>
   <div id="aimbox"></div>
-  <p class="note" style="margin:4px 0 0">« Pointer la cible » remplit latitude, direction et angle. Vent : 3 h = de droite, 12 h = de face.</p>
+  <p class="note" style="margin:4px 0 0">« Pointer la cible » remplit latitude, direction et angle. Vent : 3 h = de droite, 12 h = de face (2,5 h accepté).</p>
 
   <div class="card" style="margin-top:14px"><h2 style="margin-bottom:4px">🌍 Terrain jusqu'à la cible</h2>
     <p class="lab" style="margin:0 0 10px">${C.zones.length ? 'Le vent mesuré à ton poste est recalculé zone par zone, à la hauteur de la balle.' : 'Terrain uniforme : le vent est le même partout. Ajoute des zones si le sol change (eau, prairie, bois…).'}</p>
@@ -403,7 +426,7 @@ function calcul(a, c) {
   ${done.length ? `<h2 style="margin:20px 0 8px">Vérifications</h2><div class="scroll"><table><thead><tr><th>Date</th><th>Dist.</th><th>Cible</th><th>Proposé</th><th>Réel</th><th></th></tr></thead><tbody>${done.map(v => `<tr><td>${new Date(v.date).toLocaleDateString('fr-FR')}</td><td>${v.dist} m</td><td>${v.cible ? v.cible + ' cm' : '—'}</td><td>${v.propH} / ${v.propD}</td><td>${v.realH} / ${v.realD}</td><td><button class="btn b-out" data-x="${v.id}" aria-label="Supprimer cette vérification" style="min-height:36px;padding:0 10px">✕</button></td></tr>`).join('')}</tbody></table></div>` : ''}
   <h2 style="margin:20px 0 8px">Table de tir</h2><div class="scroll"><table><thead><tr><th>Distance</th><th>Hausse</th><th>±</th><th>Dérive</th><th>m/s</th></tr></thead><tbody id="tb"></tbody></table></div>
   <p class="note">Clics de 0,1 MRAD, dérive + = droite. Calcul 3D point-masse (G7), avec humidité, angle de tir, vent de travers et de face, saut aérodynamique, dérive gyroscopique, Coriolis et vent recalculé selon le terrain. « ± » = dispersion verticale due au SD de ta munition. Chaque correction recale le modèle : sous 600 m la vitesse, au-delà le BC, et la dérive par vent.</p></div>`;
-  const cond = () => { C.T = num($('#rt').value); if (C.T === '') C.T = 15; C.P = num($('#rp').value) || 1013; C.hum = num($('#ru').value); if (C.hum === '') C.hum = 50; C.ang = num($('#ra').value) || 0; C.W = num($('#rw').value) || 0; C.H = +$('#rh').value; C.az = num($('#rz').value); C.lat = num($('#rl').value); if (C.lat === '') C.lat = 48.7; C.h0 = num($('#rg').value) || 1;
+  const cond = () => { C.T = num($('#rt').value); if (C.T === '') C.T = 15; C.P = num($('#rp').value) || 1013; C.hum = num($('#ru').value); if (C.hum === '') C.hum = 50; C.ang = num($('#ra').value) || 0; C.W = num($('#rw').value) || 0; C.H = num($('#rh').value); if (C.H === '' ) C.H = 3; C.H = ((C.H % 12) + 12) % 12 || 12; C.az = num($('#rz').value); C.lat = num($('#rl').value); if (C.lat === '') C.lat = 48.7; C.h0 = num($('#rg').value) || 1;
     C.zones.forEach((z, i) => { z.to = num($('#zt' + i).value) || 0; z.type = $('#zs' + i).value; }); };
   const env = () => ({ T: C.T, P: C.P, hum: C.hum, ang: C.ang, W: C.W, H: C.H, az: C.az, lat: C.lat, h0: C.h0, zones: C.zones.map(z => ({ ...z })) });
   const memo = {};
@@ -437,6 +460,7 @@ function calcul(a, c) {
   C.zones.forEach((z, i) => { $('#zt' + i).onchange = $('#zs' + i).onchange = () => { sync(); save(); setTimeout(() => calcul(a, c)); }; });
   modalEl.querySelectorAll('[data-zx]').forEach(b => b.onclick = () => { sync(); C.zones.splice(+b.dataset.zx, 1); a.lastEnv.zones = C.zones; save(); calcul(a, c); });
   $('#zadd').onclick = () => { sync(); const last = C.zones[C.zones.length - 1]; C.zones.push({ to: last ? Math.min(1200, last.to + 200) : Math.max(100, C.dist), type: last ? (last.type === 'prairie' ? 'eau' : 'prairie') : 'prairie' }); a.lastEnv.zones = C.zones; save(); calcul(a, c); };
+  $('#cal').onclick = () => calypso(v => { $('#rw').value = fr(v.u); $('#rh').value = fr(v.h, 1); sync(); save('Vent Calypso : ' + fr(v.u) + ' m/s de ' + fr(v.h, 1) + ' h'); draw(); });
   $('#aim').onclick = () => {
     const box = $('#aimbox'); let hd = null, pit = null, lat = null, stop = false;
     box.innerHTML = `<div class="card" style="margin-top:10px;border-color:var(--amb)"><p style="margin:0 0 10px">Tiens le téléphone <b>à plat</b>, le haut pointé vers la cible, et incline-le pour viser.</p>
